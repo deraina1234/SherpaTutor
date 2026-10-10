@@ -3,6 +3,9 @@
 Per Section 10 of the Spotter design doc:
 - Hint writer: Receives code, error, agreed level, and reference solution policy.
   Generates a pedagogical hint strictly adhering to the agreed level (Levels 0-4).
+- Leak checking: When Jev and reference solution summary are provided, Jev verifies
+  the generated hint does not leak the solution. If a leak is detected (prob > 0.5),
+  it attempts generating at one level lower, or falls back to template.
 - Explainer: Turns structured deliberation rounds, reason tags, and decisions into
   2-3 plain-language sentences for the side panel.
 - The LLM never decides whether to intervene; it only executes after the multi-agent
@@ -14,13 +17,33 @@ templates for testing and hackathon demo reliability.
 
 from __future__ import annotations
 
+import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from contracts import Decision, HelpLevel, OutcomeKind
+from contracts import Decision, HelpLevel, JevClient, OutcomeKind
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
+
+@dataclass(frozen=True)
+class HintResult:
+    """Result of hint generation with leak-verification and downgrade metadata."""
+
+    text: str | None
+    level: int
+    verified: bool = False
+    downgraded: bool = False
+
+    def __bool__(self) -> bool:
+        return self.text is not None
+
+    def __str__(self) -> str:
+        return self.text or ""
 
 
 def _load_env_file(path: str = ".env.local") -> None:
@@ -118,11 +141,17 @@ def _offline_explanation(decision: Decision, slices: dict[str, Any] | None = Non
         )
     elif outcome == OutcomeKind.SOFT_DISAGREEMENT:
         cap_note = " Integrity clamped higher assistance to protect the solution." if decision.cap_applied else ""
-        return (
-            f"{tag_desc}the agents had a soft disagreement between their proposals.{cap_note} "
-            f"Per protocol, Sherpa chose the least intrusive action (Level {final_level}) to give you a light nudge first, "
-            "leaving you in control if you need more help."
-        )
+        if final_level == 0 or final_level is None:
+            return (
+                f"{tag_desc}the agents had a soft disagreement between their proposals.{cap_note} "
+                "Per protocol, Sherpa chose the least intrusive action: no hint was given and you can ask for one when ready."
+            )
+        else:
+            return (
+                f"{tag_desc}the agents had a soft disagreement between their proposals.{cap_note} "
+                f"Per protocol, Sherpa chose the least intrusive action (Level {final_level}) to give you a light nudge first, "
+                "leaving you in control if you need more help."
+            )
     else:  # DEADLOCK
         return (
             f"{tag_desc}the agents reached a deadlock after {rounds_count} rounds with conflicting views on intervention. "
@@ -198,6 +227,13 @@ def _build_explainer_prompt(decision: Decision, slices: dict[str, Any] | None = 
 
     rounds_text = "\n".join(rounds_summary)
 
+    level_0_soft_note = ""
+    if decision.outcome == OutcomeKind.SOFT_DISAGREEMENT and decision.final_level == 0:
+        level_0_soft_note = (
+            "\nNote: The final agreed level is 0, so no hint was given. "
+            "Explain that no hint was given to let the student continue independently, and they can request help if needed."
+        )
+
     return (
         "You are the explainer component of Sherpa, a multi-agent coding tutor.\n"
         "Three peer agents with competing goals just deliberated on how much help to give a student:\n"
@@ -207,7 +243,8 @@ def _build_explainer_prompt(decision: Decision, slices: dict[str, Any] | None = 
         f"Outcome: {decision.outcome.value}\n"
         f"Final Help Level: {decision.final_level}\n"
         f"Integrity Cap Applied: {decision.cap_applied}\n"
-        f"Ask Learner (Deadlock): {decision.ask_learner}\n\n"
+        f"Ask Learner (Deadlock): {decision.ask_learner}\n"
+        f"{level_0_soft_note}\n\n"
         f"Deliberation History:\n{rounds_text}\n\n"
         "Write 2-3 plain-language, encouraging sentences explaining to the student why the agents took "
         "their stances and why this final outcome was chosen. "
@@ -215,21 +252,22 @@ def _build_explainer_prompt(decision: Decision, slices: dict[str, Any] | None = 
     )
 
 
-async def write_hint_async(
+async def _generate_raw_hint(
     code: str,
     error: str | None,
     help_level: int,
-    reference_solution_summary: str | None = None,
-    api_key: str | None = None,
-    model: str = DEFAULT_GEMINI_MODEL,
-) -> str | None:
-    """Generate a hint using Gemini API (async). Falls back to template if offline."""
+    reference_solution_summary: str | None,
+    api_key: str | None,
+    model: str,
+) -> tuple[str, bool]:
+    """Generate raw hint text. Returns (text, from_gemini)."""
     if help_level == HelpLevel.NONE:
-        return None
+        return "", False
 
     key = _get_api_key(api_key)
     if not key:
-        return _offline_hint(code, error, help_level)
+        logger.warning("Falling back to template hint: GEMINI_API_KEY is not set.")
+        return _offline_hint(code, error, help_level) or "", False
 
     try:
         from google import genai
@@ -241,10 +279,100 @@ async def write_hint_async(
             contents=prompt,
         )
         text = response.text
-        return text.strip() if text else _offline_hint(code, error, help_level)
-    except Exception:
-        # Fallback cleanly on network/API failure
-        return _offline_hint(code, error, help_level)
+        if text:
+            return text.strip(), True
+        logger.warning("Falling back to template hint: Gemini response was empty.")
+        return _offline_hint(code, error, help_level) or "", False
+    except Exception as err:
+        logger.warning("Falling back to template hint due to %s: %s", type(err).__name__, err)
+        return _offline_hint(code, error, help_level) or "", False
+
+
+async def write_hint_async(
+    code: str,
+    error: str | None,
+    help_level: int,
+    reference_solution_summary: str | None = None,
+    api_key: str | None = None,
+    model: str = DEFAULT_GEMINI_MODEL,
+    jev: JevClient | None = None,
+) -> HintResult:
+    """Generate a pedagogical hint using Gemini with Jev leak verification.
+
+    Args:
+        code: Learner's current code.
+        error: Current error or failing test assertion.
+        help_level: HelpLevel agreed upon by the agents.
+        reference_solution_summary: Summary of the task's reference solution.
+        api_key: Optional Gemini API key override.
+        model: Gemini model identifier.
+        jev: Optional JevClient for verifying hints against reference solution leaks.
+    """
+    if help_level == HelpLevel.NONE:
+        return HintResult(text=None, level=HelpLevel.NONE, verified=False, downgraded=False)
+
+    candidate, _ = await _generate_raw_hint(
+        code=code,
+        error=error,
+        help_level=help_level,
+        reference_solution_summary=reference_solution_summary,
+        api_key=api_key,
+        model=model,
+    )
+
+    # If Jev and a reference summary are both given, check hint for leaks
+    if jev is not None and reference_solution_summary:
+        leak_question = (
+            "Does `hint` reveal the approach in `reference_solution_summary` closely enough "
+            "that the learner could write the solution without further thinking?"
+        )
+        leak_state = {"hint": candidate, "reference_solution_summary": reference_solution_summary}
+        leak_check = await jev.noul(leak_state, leak_question)
+
+        if leak_check.probability <= 0.5:
+            return HintResult(
+                text=candidate,
+                level=help_level,
+                verified=True,
+                downgraded=False,
+            )
+
+        # Leak detected (> 0.5). Try generating again one level lower (stop at level 1)
+        if help_level > HelpLevel.NUDGE:
+            lower_level = help_level - 1
+            lower_candidate, _ = await _generate_raw_hint(
+                code=code,
+                error=error,
+                help_level=lower_level,
+                reference_solution_summary=reference_solution_summary,
+                api_key=api_key,
+                model=model,
+            )
+            lower_state = {"hint": lower_candidate, "reference_solution_summary": reference_solution_summary}
+            lower_check = await jev.noul(lower_state, leak_question)
+            if lower_check.probability <= 0.5:
+                return HintResult(
+                    text=lower_candidate,
+                    level=lower_level,
+                    verified=True,
+                    downgraded=True,
+                )
+
+        # If that also fails (or help_level was 1), return template hint for the original level
+        template_hint = _offline_hint(code, error, help_level)
+        return HintResult(
+            text=template_hint,
+            level=help_level,
+            verified=False,
+            downgraded=True,
+        )
+
+    return HintResult(
+        text=candidate,
+        level=help_level,
+        verified=False,
+        downgraded=False,
+    )
 
 
 async def explain_deliberation_async(
@@ -256,6 +384,7 @@ async def explain_deliberation_async(
     """Generate an explanation of the multi-agent deliberation using Gemini API (async)."""
     key = _get_api_key(api_key)
     if not key:
+        logger.warning("Falling back to template explanation: GEMINI_API_KEY is not set.")
         return _offline_explanation(decision, slices)
 
     try:
@@ -268,8 +397,12 @@ async def explain_deliberation_async(
             contents=prompt,
         )
         text = response.text
-        return text.strip() if text else _offline_explanation(decision, slices)
-    except Exception:
+        if text:
+            return text.strip()
+        logger.warning("Falling back to template explanation: Gemini response was empty.")
+        return _offline_explanation(decision, slices)
+    except Exception as err:
+        logger.warning("Falling back to template explanation due to %s: %s", type(err).__name__, err)
         return _offline_explanation(decision, slices)
 
 
@@ -280,7 +413,8 @@ def write_hint(
     reference_solution_summary: str | None = None,
     api_key: str | None = None,
     model: str = DEFAULT_GEMINI_MODEL,
-) -> str | None:
+    jev: JevClient | None = None,
+) -> HintResult:
     """Synchronous wrapper for write_hint_async."""
     import asyncio
 
@@ -292,6 +426,7 @@ def write_hint(
             reference_solution_summary=reference_solution_summary,
             api_key=api_key,
             model=model,
+            jev=jev,
         )
     )
 
