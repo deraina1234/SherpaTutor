@@ -24,16 +24,24 @@ def log_deliberation(
 ) -> dict[str, Any]:
     """Append a deliberation record to a JSONL file.
 
+    Sanitizes slices by removing any reference solution summary to prevent leaks.
     Returns the logged record dict.
     """
     path = Path(filepath)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    sanitized_slices: dict[str, Any] = {}
+    for agent_name, sl in slices.items():
+        sl_dict = dict(sl)
+        # Never write reference solution details to disk or UI logs
+        sl_dict.pop("reference_solution_summary", None)
+        sanitized_slices[agent_name] = sl_dict
+
     record: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "session_id": session_id,
         "task_id": task_id,
-        "slices": {agent_name: dict(sl) for agent_name, sl in slices.items()},
+        "slices": sanitized_slices,
         "decision": decision.to_dict(),
         "metadata": metadata or {},
     }

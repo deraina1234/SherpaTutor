@@ -83,6 +83,23 @@ def test_inproc_bus_pub_sub() -> None:
     asyncio.run(run())
 
 
+def test_inproc_bus_immediate_registration_no_dropped_messages() -> None:
+    async def run() -> None:
+        bus = InProcBus()
+        # Subscribe first, publish before starting iteration
+        sub = bus.subscribe("topic/fast")
+        await bus.publish("topic/fast", {"seq": 1})
+        await bus.publish("topic/fast", {"seq": 2})
+
+        # Iterating should yield both messages
+        first = await anext(sub)
+        second = await anext(sub)
+        assert first["seq"] == 1
+        assert second["seq"] == 2
+
+    asyncio.run(run())
+
+
 def test_evaluate_stop_rules_consensus() -> None:
     rounds = [
         [
@@ -94,6 +111,24 @@ def test_evaluate_stop_rules_consensus() -> None:
     outcome, final_level, cap_applied, ask_learner = evaluate_stop_rules(rounds)
     assert outcome == OutcomeKind.CONSENSUS
     assert final_level == 2
+    assert not cap_applied
+    assert not ask_learner
+
+
+def test_evaluate_stop_rules_false_deadlock_prevented() -> None:
+    # Learning and Momentum vote 0 (good progress), Integrity votes 3 with cap 3.
+    # Previously Integrity's 3 caused spread=3 (deadlock).
+    # Now Integrity's cap is excluded from spread, yielding Consensus at 0.
+    rounds = [
+        [
+            make_pos("learning", 0, 0),
+            make_pos("momentum", 0, 0),
+            make_pos("integrity", 0, 3, cap=3),
+        ]
+    ]
+    outcome, final_level, cap_applied, ask_learner = evaluate_stop_rules(rounds)
+    assert outcome == OutcomeKind.CONSENSUS
+    assert final_level == 0
     assert not cap_applied
     assert not ask_learner
 
@@ -136,7 +171,7 @@ def test_evaluate_stop_rules_integrity_cap_clamping() -> None:
             make_pos("integrity", 1, 2, cap=2),
         ]
     ]
-    # momentum's 3 clamped to 2 -> all become 2 -> consensus!
+    # momentum's 3 clamped to 2 -> both voting agents are 2 -> consensus!
     outcome, final_level, cap_applied, ask_learner = evaluate_stop_rules(rounds)
     assert outcome == OutcomeKind.CONSENSUS
     assert final_level == 2
@@ -258,7 +293,7 @@ def test_deliberation_with_real_agents_and_bus() -> None:
     asyncio.run(run())
 
 
-def test_logger_roundtrip(tmp_path) -> None:
+def test_logger_roundtrip_and_redaction(tmp_path) -> None:
     log_file = tmp_path / "sessions.jsonl"
     decision = evaluate_stop_rules([[make_pos("learning", 0, 1), make_pos("momentum", 0, 2)]])
     from contracts import Decision
@@ -270,20 +305,26 @@ def test_logger_roundtrip(tmp_path) -> None:
         ask_learner=decision[3],
         rounds_used=1,
     )
-    slices = {"learning": {"learner_level": "beginner"}, "momentum": {}}
+    slices = {
+        "learning": {"learner_level": "beginner"},
+        "integrity": {"task_id": "fizzbuzz", "reference_solution_summary": "top secret loop % 15"},
+    }
 
     record = log_deliberation(
         filepath=log_file,
         session_id="sess_123",
-        task_id="two_sum",
+        task_id="fizzbuzz",
         slices=slices,
         decision=d,
         metadata={"user": "test_user"},
     )
     assert record["session_id"] == "sess_123"
+    # Ensure reference_solution_summary is scrubbed
+    assert "reference_solution_summary" not in record["slices"]["integrity"]
 
     loaded = read_deliberations(log_file)
     assert len(loaded) == 1
-    assert loaded[0]["task_id"] == "two_sum"
+    assert loaded[0]["task_id"] == "fizzbuzz"
     assert loaded[0]["decision"]["outcome"] == "soft_disagreement"
     assert loaded[0]["decision"]["final_level"] == 1
+    assert "reference_solution_summary" not in loaded[0]["slices"]["integrity"]

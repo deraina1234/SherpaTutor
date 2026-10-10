@@ -29,6 +29,32 @@ from contracts import (
 )
 
 
+class Subscription:
+    """An active subscription registered immediately upon creation."""
+
+    def __init__(self, bus: InProcBus, topic: str, queue: asyncio.Queue[dict[str, Any]]) -> None:
+        self.bus = bus
+        self.topic = topic
+        self.queue = queue
+        self._closed = False
+
+    def __aiter__(self) -> Subscription:
+        return self
+
+    async def __anext__(self) -> dict[str, Any]:
+        if self._closed:
+            raise StopAsyncIteration
+        return await self.queue.get()
+
+    def unsubscribe(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self.bus._remove_subscriber(self.topic, self.queue)
+
+    async def aclose(self) -> None:
+        self.unsubscribe()
+
+
 class InProcBus:
     """In-process async pub/sub bus implementing contracts.Bus."""
 
@@ -36,38 +62,40 @@ class InProcBus:
         self._subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
         self._wildcard_subscribers: list[asyncio.Queue[dict[str, Any]]] = []
 
+    def _remove_subscriber(self, topic: str, queue: asyncio.Queue[dict[str, Any]]) -> None:
+        if topic == "*":
+            if queue in self._wildcard_subscribers:
+                self._wildcard_subscribers.remove(queue)
+        else:
+            if topic in self._subscribers and queue in self._subscribers[topic]:
+                self._subscribers[topic].remove(queue)
+
     async def publish(self, topic: str, msg: dict[str, Any]) -> None:
         """Publish a message to a topic."""
-        for queue in self._subscribers.get(topic, []):
+        for queue in list(self._subscribers.get(topic, [])):
             await queue.put(msg)
-        for queue in self._wildcard_subscribers:
+        for queue in list(self._wildcard_subscribers):
             await queue.put(msg)
 
-    async def subscribe(self, topic: str = "*") -> AsyncIterator[dict[str, Any]]:
-        """Subscribe to messages on a topic ('*' receives all topics)."""
+    def subscribe(self, topic: str = "*") -> AsyncIterator[dict[str, Any]]:
+        """Subscribe immediately to messages on a topic ('*' receives all topics)."""
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         if topic == "*":
             self._wildcard_subscribers.append(queue)
         else:
             self._subscribers.setdefault(topic, []).append(queue)
 
-        try:
-            while True:
-                msg = await queue.get()
-                yield msg
-        finally:
-            if topic == "*":
-                if queue in self._wildcard_subscribers:
-                    self._wildcard_subscribers.remove(queue)
-            else:
-                if topic in self._subscribers and queue in self._subscribers[topic]:
-                    self._subscribers[topic].remove(queue)
+        return Subscription(self, topic, queue)
 
 
 def evaluate_stop_rules(
     rounds: list[list[Position]],
 ) -> tuple[OutcomeKind, int | None, bool, bool]:
     """Apply the protocol stop rules to the deliberation rounds.
+
+    Integrity sets a maximum safe ceiling (cap), not a help request. Therefore,
+    positions with a cap set are excluded from the spread calculation and are
+    only used to clamp voting agents' proposals.
 
     Returns:
         (outcome, final_level, cap_applied, ask_learner)
@@ -83,10 +111,16 @@ def evaluate_stop_rules(
         if p.cap is not None:
             cap = p.cap if cap is None else min(cap, p.cap)
 
-    # Check if clamping is required
+    # Active voting agents are those proposing help needs (where cap is None)
+    voting_positions = [p for p in last_positions if p.cap is None]
+    if not voting_positions:
+        # Fallback if only capped agents are present
+        voting_positions = last_positions
+
+    # Check if clamping is required on any voting agent's proposal
     cap_applied = False
     effective_levels: list[int] = []
-    for p in last_positions:
+    for p in voting_positions:
         if cap is not None and p.level > cap:
             cap_applied = True
             effective_levels.append(cap)
@@ -143,10 +177,9 @@ async def run_deliberation(
             {"round": 0, "positions": [p.to_dict() for p in current_positions]},
         )
 
-    # If all positions already agree at round 0, consensus is achieved immediately
-    initial_levels = [p.level for p in current_positions]
-    if len(set(initial_levels)) == 1:
-        outcome, final_level, cap_applied, ask_learner = evaluate_stop_rules(rounds)
+    # If voting positions already agree at round 0, consensus is achieved immediately
+    outcome, final_level, cap_applied, ask_learner = evaluate_stop_rules(rounds)
+    if outcome == OutcomeKind.CONSENSUS:
         decision = Decision(
             outcome=outcome,
             final_level=final_level,
@@ -175,8 +208,8 @@ async def run_deliberation(
 
         # Check early termination:
         # 1. Consensus reached
-        revised_levels = [p.level for p in revised_positions]
-        if len(set(revised_levels)) == 1:
+        round_outcome, _, _, _ = evaluate_stop_rules(rounds)
+        if round_outcome == OutcomeKind.CONSENSUS:
             break
 
         # 2. Unanimous hold: every agent kept its previous Position
