@@ -291,22 +291,22 @@ class Bus(Protocol):
 
 # ---------------------------------------------------------------------------
 # Jev client protocol
-# NOTE: the real Jev request/response format is unconfirmed. These shapes are our
-# internal contract; the real client adapts to them, and a fake can be swapped in.
+# These shapes are our internal contract; jev.TypeSafeJevClient adapts the real
+# API (POST /v1/systemone) to them, and a fake can be swapped in.
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class JevScore:
-    value: float
-    probabilities: dict[int, float]
+    value: float  # probability-weighted level index, 0..len(levels)-1; may fall between levels
+    probabilities: dict[int, float]  # keyed by level index
     confidence: float
 
 
 @dataclass(frozen=True)
 class JevNoul:
     probability: float
-    confidence: float
+    confidence: float  # the API returns none for nouls; adapters derive it as abs(2 * probability - 1)
 
 
 @dataclass(frozen=True)
@@ -319,7 +319,12 @@ class JevChoice:
 class JevClient(Protocol):
     """The interface agents code against for Jev judgments."""
 
-    async def score(self, state: dict, question: str, scale: tuple[int, int]) -> JevScore: ...
+    async def score(self, state: dict, question: str, levels: list[str]) -> JevScore:
+        """Rate state against ordered level descriptions, lowest first (2-10 levels).
+
+        Jev judges each description, not its number, so levels must be descriptive.
+        """
+        ...
 
     async def noul(self, state: dict, question: str) -> JevNoul: ...
 

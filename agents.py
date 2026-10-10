@@ -22,13 +22,14 @@ from contracts import (
     SliceDict,
 )
 
-LEVEL_DESCRIPTIONS: dict[int, str] = {
-    HelpLevel.NONE: "no help; let the learner keep working",
-    HelpLevel.NUDGE: "nudge: tell the learner to look at their error",
-    HelpLevel.CONCEPTUAL_HINT: "conceptual hint: explain the idea they are missing, without code",
-    HelpLevel.POINT_TO_AREA: "point to the area or line where the problem is",
-    HelpLevel.NEAR_SOLUTION: "near-solution: show most of the fix",
-}
+# Index = HelpLevel. Also used as the criteria for Jev level scores, so keep them descriptive.
+LEVEL_DESCRIPTIONS: list[str] = [
+    "no help; let the learner keep working",
+    "nudge: tell the learner to look at their error",
+    "conceptual hint: explain the idea they are missing, without code",
+    "point to the area or line where the problem is",
+    "near-solution: show most of the fix",
+]
 
 REVISE_OPTIONS: list[str] = ["lower", "hold", "raise"]
 REVISE_STEPS: dict[str, int] = {"lower": -1, "hold": 0, "raise": 1}
@@ -122,7 +123,7 @@ class LearningAgent(BaseAgent):
                 "Given the learner's skill level, recent hints, and progress in `observations`, "
                 "how much help from `help_levels` should they get now so they keep learning "
                 "rather than being handed the answer?",
-                (MIN_LEVEL, MAX_LEVEL),
+                LEVEL_DESCRIPTIONS,
             ),
             self.jev.noul(
                 state,
@@ -151,7 +152,7 @@ class MomentumAgent(BaseAgent):
             state,
             "Given the idle time, repeated errors, failed runs, and rewrites in `observations`, "
             "how much help from `help_levels` does the learner need now to get unstuck?",
-            (MIN_LEVEL, MAX_LEVEL),
+            LEVEL_DESCRIPTIONS,
         )
         if slice.get("learner_message"):
             asked = self.jev.noul(
@@ -184,7 +185,7 @@ class IntegrityAgent(BaseAgent):
                 state,
                 "For the task in `observations`, what is the most help from `help_levels` that "
                 "can be given without revealing `observations.reference_solution_summary`?",
-                (MIN_LEVEL, MAX_LEVEL),
+                LEVEL_DESCRIPTIONS,
             ),
             self.jev.noul(
                 state,
