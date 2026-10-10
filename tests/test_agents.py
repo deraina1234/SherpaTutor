@@ -123,3 +123,21 @@ def test_revise_holds_at_bounds_and_integrity_never_exceeds_cap() -> None:
 def test_revise_before_propose_raises() -> None:
     with pytest.raises(RuntimeError):
         asyncio.run(LearningAgent(FakeJevClient()).revise(LEARNING_SLICE, [], 1))
+
+
+def test_integrity_revise_holds_without_calling_jev() -> None:
+    jev = FakeJevClient(score_value=3, noul_probability=0.1, choice_selected="lower")
+    agent = IntegrityAgent(jev)
+
+    async def run() -> tuple[Position, Position]:
+        first = await agent.propose(INTEGRITY_SLICE)
+        return first, await agent.revise(INTEGRITY_SLICE, [peer("momentum", 3, ["repeated_error"])], 1)
+
+    first, revised = asyncio.run(run())
+    assert revised is first
+    assert [kind for kind, _, _ in jev.calls] == ["score", "noul"]  # propose only
+
+
+def test_integrity_revise_before_propose_raises() -> None:
+    with pytest.raises(RuntimeError):
+        asyncio.run(IntegrityAgent(FakeJevClient()).revise(INTEGRITY_SLICE, [], 1))

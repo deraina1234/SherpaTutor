@@ -173,10 +173,19 @@ class MomentumAgent(BaseAgent):
 
 
 class IntegrityAgent(BaseAgent):
-    """Sets a hard cap on the help level. Its vote starts at the cap and can only move down."""
+    """Sets a hard cap on the help level in round 0 and holds it.
+
+    The loop reads only Integrity's cap (its level is excluded from the spread),
+    so revising its level would change nothing; revise() holds without calling Jev.
+    """
 
     name = "integrity"
     goal = "Never let a hint give away the task's solution."
+
+    async def revise(self, slice: SliceDict, peers: list[Position], round: int) -> Position:
+        if self._last is None:
+            raise RuntimeError(f"{self.name}: revise() called before propose()")
+        return self._last
 
     async def _initial_position(self, slice: SliceDict) -> tuple[int, float, list[str], int | None]:
         state = self._state(slice)

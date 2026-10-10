@@ -50,6 +50,9 @@ REASON_TAGS: tuple[str, ...] = (
 
 ARGUMENT_DIRECTIONS: tuple[int, ...] = (-1, 0, 1)  # less help, neutral rebuttal, more help
 
+# Slice fields that must never reach peers, logs, the bus, or the UI.
+SECRET_SLICE_FIELDS: tuple[str, ...] = ("reference_solution_summary",)
+
 
 def _is_valid_level(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and MIN_LEVEL <= value <= MAX_LEVEL
@@ -97,6 +100,9 @@ class Argument:
             raise ValueError(f"direction must be one of {ARGUMENT_DIRECTIONS}, got {self.direction!r}")
         if self.attacks == self.id:
             raise ValueError("an argument cannot attack itself")
+        secret = [key for key in self.evidence if key in SECRET_SLICE_FIELDS]
+        if secret:
+            raise ValueError(f"evidence must not include secret slice fields: {secret}")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-safe dict for JSONL logging."""

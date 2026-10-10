@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from contracts import Decision, SliceDict
+from redaction import redact, secret_values, strip_secret_fields
 
 
 def log_deliberation(
@@ -24,27 +25,23 @@ def log_deliberation(
 ) -> dict[str, Any]:
     """Append a deliberation record to a JSONL file.
 
-    Sanitizes slices by removing any reference solution summary to prevent leaks.
+    Removes SECRET_SLICE_FIELDS from slices and redacts their values anywhere in the record.
     Returns the logged record dict.
     """
     path = Path(filepath)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    sanitized_slices: dict[str, Any] = {}
-    for agent_name, sl in slices.items():
-        sl_dict = dict(sl)
-        # Never write reference solution details to disk or UI logs
-        sl_dict.pop("reference_solution_summary", None)
-        sanitized_slices[agent_name] = sl_dict
-
+    # Never write secret slice fields (e.g. reference solutions) to disk or UI logs:
+    # drop them from the slices, then scrub their values from the whole record.
     record: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "session_id": session_id,
         "task_id": task_id,
-        "slices": sanitized_slices,
+        "slices": {agent_name: strip_secret_fields(sl) for agent_name, sl in slices.items()},
         "decision": decision.to_dict(),
         "metadata": metadata or {},
     }
+    record = redact(record, secret_values(slices))
 
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")

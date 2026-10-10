@@ -27,6 +27,7 @@ from contracts import (
     Position,
     SliceDict,
 )
+from redaction import RedactingBus, secret_values
 
 
 _UNSUBSCRIBED = object()
@@ -172,6 +173,10 @@ async def run_deliberation(
     for agent in agents:
         if agent.name not in slices:
             raise KeyError(f"Missing slice for agent '{agent.name}'")
+
+    # Every published message is scrubbed of secret slice values (e.g. reference solutions)
+    if bus is not None:
+        bus = RedactingBus(bus, secret_values(slices))
 
     # Round 0: Parallel proposals
     proposals = await asyncio.gather(*(agent.propose(slices[agent.name]) for agent in agents))
