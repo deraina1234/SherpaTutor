@@ -6,7 +6,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from jev import FakeJevClient
-from server import create_app, nudge_level, round_message, to_proposal
+from hints import HintResult
+from server import _hint, create_app, nudge_level, round_message, to_proposal
 from state_builder import task_for
 
 PID = "second-largest"
@@ -126,3 +127,18 @@ def test_triggers_queued_behind_a_running_deliberation_coalesce(tmp_path) -> Non
 
     # The running one finishes, the stale queued one is skipped, the newest runs: 2, not 3.
     assert len((tmp_path / "sessions.jsonl").read_text().splitlines()) == 2
+
+
+def test_hint_uses_level_after_jev_leak_downgrade() -> None:
+    assert _hint(HintResult(text="smaller hint", level=1, verified=True, downgraded=True), 2) == ("smaller hint", 1)
+    assert _hint(None, 2) == (None, 2)
+
+
+def test_server_runs_jev_leak_check_on_hints(tmp_path) -> None:
+    jev = FakeJevClient(score_value=1, noul_probability=0.1, choice_selected="hold")
+    with TestClient(create_app(jev=jev, log_path=tmp_path / "sessions.jsonl")) as c, c.websocket_connect("/ws") as ws:
+        ws.send_json(event("problem"))
+        ws.send_json(event("ask_nudge"))
+        assert ws.receive_json()["type"] == "hint"
+    leak_checks = [state for kind, state, _ in jev.calls if kind == "noul" and "hint" in state]
+    assert leak_checks and leak_checks[0]["reference_solution_summary"] == SECRET

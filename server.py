@@ -74,11 +74,14 @@ def nudge_level(last_hint_level: int | None, cap: int) -> int:
     return min(max((last_hint_level or 0) + 1, HelpLevel.NUDGE), cap)
 
 
-def _hint_text(result: Any) -> str | None:
-    """write_hint_async returns str | None; accept an object with .text too."""
+def _hint(result: Any, requested_level: int) -> tuple[str | None, int]:
+    """(text, level actually given) from write_hint_async's HintResult.
+
+    Jev's leak check may downgrade a hint below the requested level.
+    """
     if result is None or isinstance(result, str):
-        return result
-    return getattr(result, "text", None)
+        return result, requested_level
+    return getattr(result, "text", None), getattr(result, "level", requested_level)
 
 
 # ---------------------------------------------------------------------------
@@ -203,11 +206,13 @@ class Connection:
         context = self.session.hint_context()
         explanation, hint_result = await asyncio.gather(
             explain_deliberation_async(decision, slices),
-            write_hint_async(context["code"], context["last_error"], level, task_for(problem_id).reference_solution_summary)
+            write_hint_async(
+                context["code"], context["last_error"], level, task_for(problem_id).reference_solution_summary, jev=self.jev
+            )
             if level > 0
             else _none(),
         )
-        hint = _hint_text(hint_result)
+        hint, hint_level = _hint(hint_result, level)
 
         await self.send(
             {
@@ -218,14 +223,12 @@ class Connection:
             }
         )
         if hint:
-            await self.send({"type": "hint", "level": level, "text": redact(hint, secrets)})
-            self.session.record_hint(level)
-        self._log(slices, decision, trigger, hint_level=level if hint else None)
+            await self.send({"type": "hint", "level": hint_level, "text": redact(hint, secrets)})
+            self.session.record_hint(hint_level)
+        self._log(slices, decision, trigger, hint_level=hint_level if hint else None)
 
     async def _nudge(self, problem_id: str) -> None:
-        builder = self.session.active
-        hints = getattr(builder, "hints", [])
-        last = hints[-1].level if hints else None
+        last = self.session.last_hint_level()
         task = task_for(problem_id)
         cap = self._caps.get(problem_id, int(task.policy_max_level))
         level = nudge_level(last, cap)
@@ -234,13 +237,16 @@ class Connection:
             return
 
         context = self.session.hint_context()
-        hint = _hint_text(
-            await write_hint_async(context["code"], context["last_error"], level, task.reference_solution_summary)
+        hint, hint_level = _hint(
+            await write_hint_async(
+                context["code"], context["last_error"], level, task.reference_solution_summary, jev=self.jev
+            ),
+            level,
         )
         if hint:
             secrets = secret_values(self.session.slices())
-            await self.send({"type": "hint", "level": level, "text": redact(hint, secrets)})
-            self.session.record_hint(level)
+            await self.send({"type": "hint", "level": hint_level, "text": redact(hint, secrets)})
+            self.session.record_hint(hint_level)
 
     def _log(self, slices: dict[str, Any], decision: Any, trigger: Trigger, hint_level: int | None) -> None:
         try:
