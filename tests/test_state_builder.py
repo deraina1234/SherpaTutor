@@ -225,3 +225,71 @@ def test_every_frontend_problem_has_a_task_and_unknown_is_capped() -> None:
     s = Session(clock=None)
     s.ingest({"type": "problem", "ts": ms(0), "problem_id": "not-a-problem"})
     assert _active(s).integrity_slice().get("policy_max_level") == 2
+
+
+# -- recent_progress while stuck ------------------------------------------
+
+
+def test_edits_stop_counting_as_progress_once_the_same_error_repeats() -> None:
+    b = builder()
+    b.ingest(edit(0, STARTER))
+    b.ingest(edit(5, "def second_largest(nums):\n    return max(nums)\n"))
+    b.ingest(run(6, False, "Case 1: expected 2, got 3"))
+    assert b.recent_progress() is True  # one failure: editing still looks like work
+    b.ingest(edit(10, "def second_largest(nums):\n    return sorted(nums)[-1]\n"))
+    b.ingest(run(11, False, "Case 1: expected 2, got 3"))
+    assert b.recent_progress() is False  # same error twice: stuck, not progressing
+    assert b.learning_slice().get("recent_progress") is False
+
+
+def test_progress_runs_still_count_while_errors_repeat() -> None:
+    b = builder()
+    b.ingest(edit(0, STARTER))
+    b.ingest(run(5, False, "Case 1: expected 2, got None"))
+    b.ingest(run(10, False, "Case 3: expected 9, got 10"))  # later case fails: progress
+    b.ingest(run(15, False, "Case 3: expected 9, got 10"))
+    b.ingest(run(20, False, "Case 3: expected 9, got 10"))
+    assert b.momentum_slice().get("repeated_error_count") == 3
+    assert b.recent_progress() is True
+
+    b.ingest(run(25, True))  # a pass always counts
+    assert b.recent_progress() is True
+
+
+# -- last_hint_level ------------------------------------------------------
+
+
+def test_last_hint_level() -> None:
+    b = builder()
+    b.ingest(edit(0, STARTER))
+    assert b.last_hint_level() is None
+    b.record_hint(1)
+    b.record_hint(2)
+    assert b.last_hint_level() == 2
+
+    s = Session(clock=None)
+    assert s.last_hint_level() is None  # no active problem yet
+    s.ingest({"type": "problem", "ts": ms(0), "problem_id": "second-largest"})
+    assert s.last_hint_level() is None
+    s.record_hint(1)
+    assert s.last_hint_level() == 1
+    s.ingest({"type": "problem", "ts": ms(10), "problem_id": "two-sum"})
+    assert s.last_hint_level() is None  # hints are per problem
+    assert s.ingest({"type": "ask_nudge", "ts": ms(20), "problem_id": "two-sum"}) is Trigger.ASK_NUDGE
+
+
+# -- snapshot keeps the solution out of logs ------------------------------
+
+
+def test_snapshot_has_no_reference_solution() -> None:
+    s = Session(clock=None)
+    s.ingest({"type": "problem", "ts": ms(0), "problem_id": "second-largest"})
+    s.ingest({**run(5, False, "Case 1: expected 2, got None"), "problem_id": "second-largest"})
+    summary = TASKS["second-largest"].reference_solution_summary
+    dumped = json.dumps(s.snapshot())
+    assert summary not in dumped
+    assert "reference_solution_summary" not in dumped
+    assert s.snapshot()["slices"]["integrity"]["task_id"] == "second-largest"
+    # Deliberation still gets it
+    assert _active(s).integrity_slice().get("reference_solution_summary") == summary
+

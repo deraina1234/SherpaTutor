@@ -49,6 +49,7 @@ from enum import Enum
 from typing import Any
 
 from contracts import HelpLevel, HintRecord, IntegritySlice, LearningSlice, MomentumSlice
+from redaction import strip_secret_fields
 
 # ---------------------------------------------------------------------------
 # Tunable thresholds. Starting guesses; adjust on recorded sessions.
@@ -59,7 +60,8 @@ LONG_IDLE_SECONDS = 180  # idle trigger fires once per idle stretch
 HEARTBEAT_SECONDS = 20  # deliberate at least this often while the learner is active
 MIN_TRIGGER_GAP_SECONDS = 3  # debounce automatic triggers (chat / ask_nudge always fire)
 RECENT_PROGRESS_SECONDS = 120  # a progress run this recent counts as recent_progress
-ACTIVE_EDIT_SECONDS = 30  # editing this recently also counts as recent_progress
+ACTIVE_EDIT_SECONDS = 30  # editing this recently also counts as recent_progress...
+STUCK_REPEATED_ERRORS = 2  # ...unless the same error has repeated this many times (matches agents.REPEATED_ERROR_COUNT)
 LEARNER_MESSAGE_TTL_SECONDS = 300  # how long a chat message stays in Momentum's slice
 HINT_HISTORY_LIMIT = 10
 CODE_EXCERPT_LINES = 150  # design doc §9: truncate code to ~150 lines
@@ -376,6 +378,14 @@ class StateBuilder:
         self._last_trigger_at = t
         self._activity_since_trigger = False
 
+    def last_hint_level(self) -> int | None:
+        """Level of the most recently recorded hint, or None if none has been given.
+
+        The server uses it for ask_nudge: give one level more than the last hint instead
+        of re-running the deliberation.
+        """
+        return self.hints[-1].level if self.hints else None
+
     def record_hint(self, level: int, now: float | None = None) -> None:
         """Call after a hint is shown, so Learning sees it in hint_history."""
         self.hints.append(_Hint(level=int(level), at=self._now(now)))
@@ -441,7 +451,11 @@ class StateBuilder:
         return "\n".join(lines[start : start + max_lines])
 
     def snapshot(self, now: float | None = None) -> dict[str, Any]:
-        """JSON-safe dump for the JSONL logger: every feature plus the three slices."""
+        """JSON-safe dump for the JSONL logger: every feature plus the three slices.
+
+        Secret slice fields (the reference solution) are stripped, since this goes to logs.
+        slices() keeps them, because Integrity needs them to deliberate.
+        """
         t = self._now(now)
         return {
             "t": t,
@@ -459,7 +473,7 @@ class StateBuilder:
                 "total_edits": self.total_edits,
                 "hints_given": len(self.hints),
             },
-            "slices": self.slices(t),
+            "slices": {name: strip_secret_fields(sl) for name, sl in self.slices(t).items()},
         }
 
     # -- derived values -----------------------------------------------------
@@ -472,12 +486,17 @@ class StateBuilder:
     def recent_progress(self, now: float | None = None) -> bool:
         """A progress run within RECENT_PROGRESS_SECONDS, or editing within ACTIVE_EDIT_SECONDS.
 
-        Learning's slice has no edit timing, so this is how it sees an actively working
-        learner (demo scenario 2: rewriting, but hitting the same error).
+        A progress run is a pass, or a run whose first failing case is later than before.
+        Recent edits count only while the learner is not stuck: once the same error has
+        repeated STUCK_REPEATED_ERRORS times, editing is churn, not progress. (A failed run
+        almost always follows an edit, so without this Learning sees a learner with three
+        identical failures as progressing, votes for no help, and the deliberation deadlocks.)
         """
         t = self._now(now)
         if self.last_progress_at is not None and t - self.last_progress_at <= RECENT_PROGRESS_SECONDS:
             return True
+        if self.repeated_error_count >= STUCK_REPEATED_ERRORS:
+            return False
         return self.last_edit_at is not None and t - self.last_edit_at <= ACTIVE_EDIT_SECONDS
 
     # -- event handlers -----------------------------------------------------
@@ -636,6 +655,11 @@ class Session:
     def record_hint(self, level: int, now: float | None = None) -> None:
         self._require().record_hint(level, now)
 
+    def last_hint_level(self) -> int | None:
+        """Last hint level on the active problem, or None if there is none (or no problem yet)."""
+        b = self.active
+        return b.last_hint_level() if b is not None else None
+
     def hint_context(self, max_lines: int = CODE_EXCERPT_LINES) -> dict[str, Any]:
         return self._require().hint_context(max_lines)
 
@@ -647,3 +671,4 @@ class Session:
         if b is None:
             raise RuntimeError("no active problem yet; wait for a problem/edit/run event")
         return b
+    
