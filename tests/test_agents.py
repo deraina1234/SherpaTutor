@@ -95,8 +95,8 @@ def test_revise_sends_peers_but_not_self_to_jev() -> None:
     assert state["my_position"]["level"] == 1
 
 
-def test_revise_holds_on_low_confidence() -> None:
-    agent = LearningAgent(FakeJevClient(score_value=1, choice_selected="raise", confidence=0.3))
+def test_revise_holds_when_margin_over_hold_is_too_small() -> None:
+    agent = LearningAgent(FakeJevClient(score_value=1, choice_probabilities={"lower": 0.19, "hold": 0.40, "raise": 0.41}))
 
     async def run() -> tuple[Position, Position]:
         first = await agent.propose(LEARNING_SLICE)
@@ -104,6 +104,34 @@ def test_revise_holds_on_low_confidence() -> None:
 
     first, revised = asyncio.run(run())
     assert revised is first
+
+
+def test_revise_moves_on_clear_margin_despite_low_choice_confidence() -> None:
+    # Real Jev returned this for a stuck learner: "raise" wins, but Choice confidence is only 0.13.
+    jev = FakeJevClient(score_value=1, confidence=0.13, choice_probabilities={"lower": 0.15, "hold": 0.38, "raise": 0.47})
+    agent = LearningAgent(jev)
+
+    async def run() -> Position:
+        await agent.propose(LEARNING_SLICE)
+        return await agent.revise(LEARNING_SLICE, [peer("momentum", 3, ["repeated_error"])], 1)
+
+    revised = asyncio.run(run())
+    assert (revised.level, revised.round, revised.confidence) == (2, 1, 0.47)
+
+
+def test_voting_agents_never_score_or_raise_into_near_solution() -> None:
+    jev = FakeJevClient(score_value=4, noul_probability=0.1, choice_selected="raise")
+    agent = MomentumAgent(jev)
+
+    async def run() -> tuple[Position, Position]:
+        first = await agent.propose(MOMENTUM_SLICE)
+        return first, await agent.revise(MOMENTUM_SLICE, [], 1)
+
+    first, revised = asyncio.run(run())
+    assert first.level == 3
+    assert revised is first
+    _, score_state, _ = jev.calls[0]
+    assert len(score_state["help_levels"]) == 4
 
 
 def test_revise_holds_at_bounds_and_integrity_never_exceeds_cap() -> None:

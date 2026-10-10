@@ -30,12 +30,16 @@ LEVEL_DESCRIPTIONS: list[str] = [
     "point to the area or line where the problem is",
     "near-solution: show most of the fix",
 ]
+# Learning and Momentum vote on these; near-solution is blocked by default, so it is never a vote.
+VOTING_LEVELS: list[str] = LEVEL_DESCRIPTIONS[: HelpLevel.NEAR_SOLUTION]
 
 REVISE_OPTIONS: list[str] = ["lower", "hold", "raise"]
 REVISE_STEPS: dict[str, int] = {"lower": -1, "hold": 0, "raise": 1}
 
 # Tunable thresholds. Starting guesses; adjust them on real runs.
-MIN_REVISE_CONFIDENCE = 0.5  # below this, an agent holds instead of moving
+# Move only when the chosen direction beats "hold" by more than this probability margin.
+# Not Choice confidence: with three close options it stays low even when the winner is clear.
+MIN_REVISE_MARGIN = 0.02
 TAG_PROBABILITY = 0.6  # a Noul above this adds its reason tag
 RECENT_HINT_SECONDS = 120
 LONG_IDLE_SECONDS = 180
@@ -52,6 +56,7 @@ class BaseAgent:
 
     name: str
     goal: str
+    levels: list[str] = VOTING_LEVELS  # scale this agent scores and votes on; index = level
 
     def __init__(self, jev: JevClient) -> None:
         self.jev = jev
@@ -71,7 +76,7 @@ class BaseAgent:
 
         state = {
             "agent": {"name": self.name, "goal": self.goal},
-            "help_levels": LEVEL_DESCRIPTIONS,
+            "help_levels": self.levels,
             "observations": dict(slice),
             "my_position": previous.to_dict(),
             "peer_positions": [p.to_dict() for p in peers if p.agent != self.name],
@@ -89,15 +94,17 @@ class BaseAgent:
 
         step = REVISE_STEPS.get(result.selected, 0) * MAX_LEVEL_STEP_PER_ROUND
         new_level = previous.level + step
-        ceiling = MAX_LEVEL if previous.cap is None else previous.cap
-        if step == 0 or result.confidence < MIN_REVISE_CONFIDENCE or not MIN_LEVEL <= new_level <= ceiling:
+        ceiling = len(self.levels) - 1 if previous.cap is None else min(previous.cap, len(self.levels) - 1)
+        selected_probability = result.probabilities.get(result.selected, 0.0)
+        margin = selected_probability - result.probabilities.get("hold", 0.0)
+        if step == 0 or margin <= MIN_REVISE_MARGIN or not MIN_LEVEL <= new_level <= ceiling:
             return previous
 
         self._last = Position(
             agent=self.name,
             round=round,
             level=new_level,
-            confidence=result.confidence,
+            confidence=selected_probability,
             reason_tags=previous.reason_tags,
             cap=previous.cap,
         )
@@ -108,7 +115,7 @@ class BaseAgent:
         raise NotImplementedError
 
     def _state(self, slice: SliceDict) -> dict[str, Any]:
-        return {"agent": {"name": self.name, "goal": self.goal}, "help_levels": LEVEL_DESCRIPTIONS, "observations": dict(slice)}
+        return {"agent": {"name": self.name, "goal": self.goal}, "help_levels": self.levels, "observations": dict(slice)}
 
 
 class LearningAgent(BaseAgent):
@@ -123,7 +130,7 @@ class LearningAgent(BaseAgent):
                 "Given the learner's skill level, recent hints, and progress in `observations`, "
                 "how much help from `help_levels` should they get now so they keep learning "
                 "rather than being handed the answer?",
-                LEVEL_DESCRIPTIONS,
+                self.levels,
             ),
             self.jev.noul(
                 state,
@@ -152,7 +159,7 @@ class MomentumAgent(BaseAgent):
             state,
             "Given the idle time, repeated errors, failed runs, and rewrites in `observations`, "
             "how much help from `help_levels` does the learner need now to get unstuck?",
-            LEVEL_DESCRIPTIONS,
+            self.levels,
         )
         if slice.get("learner_message"):
             asked = self.jev.noul(
@@ -181,6 +188,7 @@ class IntegrityAgent(BaseAgent):
 
     name = "integrity"
     goal = "Never let a hint give away the task's solution."
+    levels = LEVEL_DESCRIPTIONS  # judges the full scale; the cap is then clamped to policy_max_level
 
     async def revise(self, slice: SliceDict, peers: list[Position], round: int) -> Position:
         if self._last is None:
@@ -194,7 +202,7 @@ class IntegrityAgent(BaseAgent):
                 state,
                 "For the task in `observations`, what is the most help from `help_levels` that "
                 "can be given without revealing `observations.reference_solution_summary`?",
-                LEVEL_DESCRIPTIONS,
+                self.levels,
             ),
             self.jev.noul(
                 state,

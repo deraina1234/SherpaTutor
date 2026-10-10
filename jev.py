@@ -80,11 +80,13 @@ class FakeJevClient:
         noul_probability: float = 0.5,
         choice_selected: str = "hold",
         confidence: float = 0.9,
+        choice_probabilities: dict[str, float] | None = None,  # overrides choice_selected; highest wins
     ) -> None:
         self.score_value = score_value
         self.noul_probability = noul_probability
         self.choice_selected = choice_selected
         self.confidence = confidence
+        self.choice_probabilities = choice_probabilities
         self.calls: list[tuple[str, dict, str]] = []
 
     async def score(self, state: dict, question: str, levels: list[str]) -> JevScore:
@@ -98,6 +100,10 @@ class FakeJevClient:
 
     async def choice(self, state: dict, question: str, options: list[str]) -> JevChoice:
         self.calls.append(("choice", state, question))
+        if self.choice_probabilities is not None:
+            probabilities = {option: self.choice_probabilities.get(option, 0.0) for option in options}
+            selected = max(probabilities, key=probabilities.__getitem__)
+            return JevChoice(selected=selected, probabilities=probabilities, confidence=self.confidence)
         selected = self.choice_selected if self.choice_selected in options else options[0]
         probabilities = {option: 1.0 if option == selected else 0.0 for option in options}
         return JevChoice(selected=selected, probabilities=probabilities, confidence=self.confidence)
