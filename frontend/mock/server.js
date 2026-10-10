@@ -1,0 +1,73 @@
+const { WebSocketServer } = require("ws");
+const wss = new WebSocketServer({ port: 8000, path: "/ws" });
+
+const P = (agent, level, confidence, tags, cap) => ({ agent, level, confidence, tags, ...(cap !== undefined ? { cap } : {}) });
+
+// Each failed Run plays the next scenario: consensus, soft disagreement, deadlock.
+const SCENARIOS = [
+  {
+    rounds: [
+      [P("Learning", 1, 0.55, ["recent_progress"]), P("Momentum", 2, 0.8, ["repeated_error"]), P("Integrity", 2, 0.9, ["solution_leak_risk"], 2)],
+      [P("Learning", 2, 0.65, ["recent_progress"]), P("Momentum", 2, 0.8, ["repeated_error"]), P("Integrity", 2, 0.9, ["solution_leak_risk"], 2)],
+    ],
+    decision: {
+      outcome: "consensus",
+      level: 2,
+      explanation: "Learning relaxed once it saw the same error three times. All three agents agree on a conceptual hint.",
+    },
+    hint: { level: 2, text: "Think about what happens to your result when the list has duplicate values." },
+  },
+  {
+    rounds: [
+      [P("Learning", 0, 0.7, ["productive_struggle"]), P("Momentum", 2, 0.6, ["repeated_error"]), P("Integrity", 2, 0.9, ["solution_leak_risk"], 2)],
+      [P("Learning", 1, 0.6, ["productive_struggle"]), P("Momentum", 2, 0.6, ["repeated_error"]), P("Integrity", 2, 0.9, ["solution_leak_risk"], 2)],
+      [P("Learning", 1, 0.55, ["productive_struggle"]), P("Momentum", 2, 0.65, ["repeated_error"]), P("Integrity", 2, 0.9, ["solution_leak_risk"], 2)],
+    ],
+    decision: {
+      outcome: "soft_disagreement",
+      level: 1,
+      explanation: "Learning wanted to wait because the learner is actively rewriting; Momentum saw repeated errors. Acting at the lower level and offering more.",
+    },
+    hint: { level: 1, text: "Look at your error message carefully." },
+  },
+  {
+    rounds: [
+      [P("Learning", 0, 0.75, ["productive_struggle"]), P("Momentum", 2, 0.7, ["long_idle"]), P("Integrity", 2, 0.9, ["policy_cap"], 2)],
+      [P("Learning", 0, 0.7, ["productive_struggle"]), P("Momentum", 2, 0.7, ["long_idle"]), P("Integrity", 2, 0.9, ["policy_cap"], 2)],
+      [P("Learning", 0, 0.7, ["productive_struggle"]), P("Momentum", 2, 0.7, ["long_idle"]), P("Integrity", 2, 0.9, ["policy_cap"], 2)],
+      [P("Learning", 0, 0.7, ["productive_struggle"]), P("Momentum", 2, 0.7, ["long_idle"]), P("Integrity", 2, 0.9, ["policy_cap"], 2)],
+    ],
+    decision: {
+      outcome: "deadlock",
+      level: 0,
+      explanation: "Learning and Momentum are two levels apart after three rounds and neither moved. Keeping the disagreement and asking the learner.",
+    },
+    hint: null,
+  },
+];
+
+let runCount = 0;
+
+wss.on("connection", (ws) => {
+  console.log("client connected");
+  const send = (m) => ws.send(JSON.stringify(m));
+
+  ws.on("message", (raw) => {
+    const m = JSON.parse(raw);
+    console.log("got", m.type, m.problem_id || "");
+
+    if (m.type === "run" && !m.passed) {
+      const s = SCENARIOS[runCount++ % SCENARIOS.length];
+      s.rounds.forEach((proposals, i) => setTimeout(() => send({ type: "round", round: i, proposals }), i * 800));
+      setTimeout(() => {
+        send({ type: "decision", ...s.decision });
+        if (s.hint) send({ type: "hint", ...s.hint });
+      }, s.rounds.length * 800);
+    }
+
+    if (m.type === "ask_nudge") {
+      setTimeout(() => send({ type: "hint", level: 2, text: "Try sorting the values first, then think about which position you need." }), 400);
+    }
+  });
+});
+console.log("mock backend on ws://localhost:8000/ws");
