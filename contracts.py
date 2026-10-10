@@ -48,8 +48,72 @@ REASON_TAGS: tuple[str, ...] = (
 )
 
 
+ARGUMENT_DIRECTIONS: tuple[int, ...] = (-1, 0, 1)  # less help, neutral rebuttal, more help
+
+
 def _is_valid_level(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and MIN_LEVEL <= value <= MAX_LEVEL
+
+
+def _is_valid_round(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+# ---------------------------------------------------------------------------
+# Argument
+# ---------------------------------------------------------------------------
+
+
+def argument_id(agent: str, round: int, claim: str) -> str:
+    """Canonical Argument id, e.g. "momentum.r0.long_idle"."""
+    return f"{agent}.r{round}.{claim}"
+
+
+@dataclass(frozen=True)
+class Argument:
+    """A claim backed by evidence from the arguing agent's own slice.
+
+    Code builds arguments; Jev judges whether they hold up. An argument with
+    `attacks` set is a rebuttal of the argument with that id. The loop decides
+    which arguments still stand; agents revise against those, not raw votes.
+    """
+
+    id: str  # see argument_id()
+    agent: str
+    round: int  # round the argument was made in
+    claim: str  # a REASON_TAG
+    direction: int  # -1 less help, +1 more help, 0 pure rebuttal
+    evidence: dict[str, Any] = field(default_factory=dict)  # JSON-safe values copied from the agent's slice
+    attacks: str | None = None  # id of the argument this rebuts
+
+    def __post_init__(self) -> None:
+        if not self.id:
+            raise ValueError("id must be non-empty")
+        if not _is_valid_round(self.round):
+            raise ValueError(f"round must be a non-negative int, got {self.round!r}")
+        if self.claim not in REASON_TAGS:
+            raise ValueError(f"unknown claim {self.claim!r}; allowed: {REASON_TAGS}")
+        if self.direction not in ARGUMENT_DIRECTIONS or isinstance(self.direction, bool):
+            raise ValueError(f"direction must be one of {ARGUMENT_DIRECTIONS}, got {self.direction!r}")
+        if self.attacks == self.id:
+            raise ValueError("an argument cannot attack itself")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict for JSONL logging."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Argument:
+        """Rebuild an Argument from to_dict() output."""
+        return cls(
+            id=data["id"],
+            agent=data["agent"],
+            round=data["round"],
+            claim=data["claim"],
+            direction=data["direction"],
+            evidence=dict(data.get("evidence", {})),
+            attacks=data.get("attacks"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -67,9 +131,10 @@ class Position:
     confidence: float  # 0.0-1.0
     reason_tags: list[str] = field(default_factory=list)
     cap: int | None = None  # only Integrity sets this; hard ceiling on the help level
+    arguments: list[Argument] = field(default_factory=list)  # this agent's arguments and rebuttals backing the position
 
     def __post_init__(self) -> None:
-        if not isinstance(self.round, int) or isinstance(self.round, bool) or self.round < 0:
+        if not _is_valid_round(self.round):
             raise ValueError(f"round must be a non-negative int, got {self.round!r}")
         if not _is_valid_level(self.level):
             raise ValueError(f"level must be an int in {MIN_LEVEL}..{MAX_LEVEL}, got {self.level!r}")
@@ -84,12 +149,16 @@ class Position:
             raise ValueError(f"unknown reason tags {unknown}; allowed: {REASON_TAGS}")
         if self.cap is not None and not _is_valid_level(self.cap):
             raise ValueError(f"cap must be None or an int in {MIN_LEVEL}..{MAX_LEVEL}, got {self.cap!r}")
+        foreign = [a.id for a in self.arguments if a.agent != self.agent]
+        if foreign:
+            raise ValueError(f"{self.agent} position carries arguments from other agents: {foreign}")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-safe dict for JSONL logging."""
         data = asdict(self)
         data["level"] = int(self.level)
         data["cap"] = None if self.cap is None else int(self.cap)
+        data["arguments"] = [a.to_dict() for a in self.arguments]
         return data
 
     @classmethod
@@ -102,6 +171,7 @@ class Position:
             confidence=data["confidence"],
             reason_tags=list(data.get("reason_tags", [])),
             cap=data.get("cap"),
+            arguments=[Argument.from_dict(a) for a in data.get("arguments", [])],
         )
 
 
@@ -266,6 +336,16 @@ if __name__ == "__main__":
         confidence=0.8,
         reason_tags=["solution_leak_risk"],
         cap=HelpLevel.POINT_TO_AREA,
+        arguments=[
+            Argument(
+                id=argument_id("integrity", 0, "solution_leak_risk"),
+                agent="integrity",
+                round=0,
+                claim="solution_leak_risk",
+                direction=-1,
+                evidence={"task_id": "fizzbuzz"},
+            )
+        ],
     )
     decision = Decision(
         outcome=OutcomeKind.CONSENSUS,
