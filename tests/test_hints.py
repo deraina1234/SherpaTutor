@@ -31,7 +31,7 @@ def make_pos(agent: str, round: int, level: int, cap: int | None = None, tags: l
 
 
 def test_write_hint_level_0_returns_none() -> None:
-    hint = write_hint("def f(): pass", "IndexError", HelpLevel.NONE)
+    hint = write_hint("def f(): pass", "IndexError", HelpLevel.NONE, api_key="")
     assert hint.text is None
     assert hint.level == 0
     assert not hint.verified
@@ -41,7 +41,7 @@ def test_write_hint_level_0_returns_none() -> None:
 
 @pytest.mark.parametrize("level", [HelpLevel.NUDGE, HelpLevel.CONCEPTUAL_HINT, HelpLevel.POINT_TO_AREA])
 def test_offline_hint_generation(level: int) -> None:
-    hint = write_hint("def f(): pass", "IndexError: list index out of range", level)
+    hint = write_hint("def f(): pass", "IndexError: list index out of range", level, api_key="")
     assert hint.text is not None
     assert len(hint.text) > 10
     assert "IndexError" in hint.text
@@ -59,7 +59,7 @@ def test_offline_explanation_consensus() -> None:
         ask_learner=False,
         rounds_used=1,
     )
-    exp = explain_deliberation(decision)
+    exp = explain_deliberation(decision, api_key="")
     assert "consensus" in exp
     assert "Level 2" in exp
     assert "concept" in exp
@@ -77,7 +77,7 @@ def test_offline_explanation_soft_disagreement_level_1() -> None:
         ask_learner=False,
         rounds_used=2,
     )
-    exp = explain_deliberation(decision)
+    exp = explain_deliberation(decision, api_key="")
     assert "soft disagreement" in exp
     assert "least intrusive" in exp
     assert "Level 1" in exp
@@ -97,7 +97,7 @@ def test_offline_explanation_soft_disagreement_level_0() -> None:
         ask_learner=False,
         rounds_used=2,
     )
-    exp = explain_deliberation(decision)
+    exp = explain_deliberation(decision, api_key="")
     assert "soft disagreement" in exp
     assert "no hint was given" in exp
     assert "ask for one" in exp
@@ -113,7 +113,7 @@ def test_offline_explanation_deadlock() -> None:
         ask_learner=True,
         rounds_used=1,
     )
-    exp = explain_deliberation(decision)
+    exp = explain_deliberation(decision, api_key="")
     assert "deadlock" in exp
     assert "stayed silent" in exp
 
@@ -179,6 +179,7 @@ def test_jev_verification_passes_with_safe_hint() -> None:
         error="IndexError",
         help_level=HelpLevel.CONCEPTUAL_HINT,
         reference_solution_summary="binary search",
+        api_key="",
         jev=jev,
     )
     assert hint.verified is True
@@ -208,6 +209,7 @@ def test_jev_verification_downgrades_leaked_hint() -> None:
         error="IndexError",
         help_level=HelpLevel.CONCEPTUAL_HINT,  # level 2
         reference_solution_summary="binary search",
+        api_key="",
         jev=jev,
     )
     # Leaked at level 2 -> downgraded to level 1 (NUDGE) and verified safe!
@@ -225,6 +227,7 @@ def test_jev_verification_fails_downgrade_returns_template() -> None:
         error="IndexError",
         help_level=HelpLevel.CONCEPTUAL_HINT,
         reference_solution_summary="binary search",
+        api_key="",
         jev=jev,
     )
     # Both level 2 and level 1 leak -> returns template hint for original level

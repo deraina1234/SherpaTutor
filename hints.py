@@ -27,7 +27,7 @@ from contracts import Decision, HelpLevel, JevClient, OutcomeKind
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 
 
 @dataclass(frozen=True)
@@ -68,7 +68,9 @@ _load_env_file()
 
 
 def _get_api_key(explicit_key: str | None = None) -> str | None:
-    return explicit_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if explicit_key is not None:
+        return explicit_key.strip() or None
+    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 
 # ---------------------------------------------------------------------------
