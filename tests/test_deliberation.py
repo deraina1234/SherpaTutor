@@ -100,6 +100,32 @@ def test_inproc_bus_immediate_registration_no_dropped_messages() -> None:
     asyncio.run(run())
 
 
+def test_inproc_bus_unsubscribe_wakes_waiting_reader() -> None:
+    async def run() -> None:
+        bus = InProcBus()
+        sub = bus.subscribe("topic/wait")
+        stopped = False
+
+        async def reader() -> None:
+            nonlocal stopped
+            try:
+                async for _ in sub:
+                    pass
+            except StopAsyncIteration:
+                pass
+            stopped = True
+
+        task = asyncio.create_task(reader())
+        await asyncio.sleep(0.01)
+
+        # Calling unsubscribe while reader is waiting on queue.get() should wake it up
+        sub.unsubscribe()
+        await asyncio.wait_for(task, timeout=0.5)
+        assert stopped
+
+    asyncio.run(run())
+
+
 def test_evaluate_stop_rules_consensus() -> None:
     rounds = [
         [

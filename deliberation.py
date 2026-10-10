@@ -29,10 +29,13 @@ from contracts import (
 )
 
 
+_UNSUBSCRIBED = object()
+
+
 class Subscription:
     """An active subscription registered immediately upon creation."""
 
-    def __init__(self, bus: InProcBus, topic: str, queue: asyncio.Queue[dict[str, Any]]) -> None:
+    def __init__(self, bus: InProcBus, topic: str, queue: asyncio.Queue[Any]) -> None:
         self.bus = bus
         self.topic = topic
         self.queue = queue
@@ -42,14 +45,18 @@ class Subscription:
         return self
 
     async def __anext__(self) -> dict[str, Any]:
-        if self._closed:
+        if self._closed and self.queue.empty():
             raise StopAsyncIteration
-        return await self.queue.get()
+        msg = await self.queue.get()
+        if msg is _UNSUBSCRIBED:
+            raise StopAsyncIteration
+        return msg
 
     def unsubscribe(self) -> None:
         if not self._closed:
             self._closed = True
             self.bus._remove_subscriber(self.topic, self.queue)
+            self.queue.put_nowait(_UNSUBSCRIBED)
 
     async def aclose(self) -> None:
         self.unsubscribe()
