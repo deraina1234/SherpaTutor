@@ -1,0 +1,39 @@
+{
+  "name": "sherpa-momentum-agent",
+  "description": "Sherpa peer agent that keeps a programming learner moving: it argues for stepping in before they stall. Sees idle time, repeated identical errors, failed runs, same-function rewrites, and learner chat messages; uses the Jev decision model to vote on a help level and revise against its peers.",
+  "schema_version": "1.1.0",
+  "version": "0.1.0",
+  "authors": [
+    "Sherpa team"
+  ],
+  "created_at": "2026-10-10T00:00:00Z",
+  "domains": [
+    {
+      "name": "education/e_learning",
+      "id": 601
+    }
+  ],
+  "modules": [],
+  "locators": [
+    {
+      "type": "source_code",
+      "urls": [
+        "https://github.com/wishruth/Sherpa/blob/main/agents.py"
+      ]
+    }
+  ],
+  "skills": [
+    {
+      "name": "ai_ml_engineering/agent_orchestration/negotiation_resolution",
+      "id": 70905
+    },
+    {
+      "name": "ai_ml_engineering/agent_orchestration/multi_agent_coordination",
+      "id": 70901
+    },
+    {
+      "name": "software_engineering/code_debugging",
+      "id": 606
+    }
+  ]
+}

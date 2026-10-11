@@ -1,0 +1,35 @@
+{
+  "name": "sherpa-integrity-agent",
+  "description": "Sherpa peer agent that keeps hints from giving away a task's solution. It is the only agent that sees the reference solution summary; it sets a hard cap on the help level the other agents' consensus may reach, and its cap is enforced by the deliberation loop.",
+  "schema_version": "1.1.0",
+  "version": "0.1.0",
+  "authors": [
+    "Sherpa team"
+  ],
+  "created_at": "2026-10-10T00:00:00Z",
+  "domains": [
+    {
+      "name": "education/e_learning",
+      "id": 601
+    }
+  ],
+  "modules": [],
+  "locators": [
+    {
+      "type": "source_code",
+      "urls": [
+        "https://github.com/wishruth/Sherpa/blob/main/agents.py"
+      ]
+    }
+  ],
+  "skills": [
+    {
+      "name": "ai_ml_engineering/ai_safety/runtime_guardrails",
+      "id": 71201
+    },
+    {
+      "name": "ai_ml_engineering/agent_orchestration/negotiation_resolution",
+      "id": 70905
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "name": "sherpa-learning-agent",
+  "description": "Sherpa peer agent that protects the learner's learning: it argues for the least help that keeps a programming learner productively struggling. Sees learner level, hint history, time on task, and recent progress; uses the Jev decision model to vote on a help level (0-3) and to decide whether peers' reasons justify moving one level per deliberation round.",
+  "schema_version": "1.1.0",
+  "version": "0.1.0",
+  "authors": [
+    "Sherpa team"
+  ],
+  "created_at": "2026-10-10T00:00:00Z",
+  "domains": [
+    {
+      "name": "education/e_learning",
+      "id": 601
+    }
+  ],
+  "modules": [],
+  "locators": [
+    {
+      "type": "source_code",
+      "urls": [
+        "https://github.com/wishruth/Sherpa/blob/main/agents.py"
+      ]
+    }
+  ],
+  "skills": [
+    {
+      "name": "ai_ml_engineering/agent_orchestration/negotiation_resolution",
+      "id": 70905
+    },
+    {
+      "name": "ai_ml_engineering/agent_orchestration/multi_agent_coordination",
+      "id": 70901
+    }
+  ]
+}

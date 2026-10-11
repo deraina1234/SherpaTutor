@@ -25,6 +25,7 @@ from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from agents import IntegrityAgent, LearningAgent, MomentumAgent
+from agntcy_slim import FanoutBus, Publisher, start_publisher_from_env
 from contracts import HelpLevel, JevClient
 from deliberation import InProcBus, run_deliberation
 from hints import explain_deliberation_async, write_hint_async
@@ -90,10 +91,11 @@ def _hint(result: Any, requested_level: int) -> tuple[str | None, int]:
 
 
 class Connection:
-    def __init__(self, ws: WebSocket, jev: JevClient, log_path: Path) -> None:
+    def __init__(self, ws: WebSocket, jev: JevClient, log_path: Path, slim: Publisher | None = None) -> None:
         self.ws = ws
         self.jev = jev
         self.log_path = log_path
+        self.slim = slim  # AGNTCY SLIM channel that also receives every (redacted) round and decision
         self.session = Session()
         self.session_id = uuid.uuid4().hex[:8]
         self._work_lock = asyncio.Lock()  # one deliberation or nudge at a time
@@ -167,8 +169,13 @@ class Connection:
         silent = trigger in SILENT_TRIGGERS
         held_rounds: list[dict[str, Any]] = []
 
-        bus = InProcBus()
-        subscription = bus.subscribe("*")
+        local_bus = InProcBus()
+        subscription = local_bus.subscribe("*")
+        bus = (
+            FanoutBus(local_bus, self.slim, {"session_id": self.session_id, "problem_id": problem_id, "trigger": trigger.value})
+            if self.slim is not None
+            else local_bus
+        )
 
         async def forward_rounds(messages: AsyncIterator[dict[str, Any]]) -> None:
             async for message in messages:
@@ -271,19 +278,31 @@ async def _none() -> None:
 # ---------------------------------------------------------------------------
 
 
-def create_app(jev: JevClient | None = None, log_path: Path = DEFAULT_LOG_PATH) -> FastAPI:
-    """Build the app. Pass `jev` (e.g. FakeJevClient) to run without the TypeSafe API."""
+def create_app(
+    jev: JevClient | None = None, log_path: Path = DEFAULT_LOG_PATH, slim: Publisher | None = None
+) -> FastAPI:
+    """Build the app. Pass `jev` (e.g. FakeJevClient) to run without the TypeSafe API.
+
+    In the real app, SLIM publishing starts when SLIM_ENDPOINT is set (see agntcy_slim.py);
+    tests can pass a fake `slim` publisher instead.
+    """
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if jev is not None:
-            app.state.jev = jev
+            app.state.jev, app.state.slim = jev, slim
             yield
             return
         _load_env_file(str(ROOT / ".env.local"))
-        async with TypeSafeJevClient() as client:
-            app.state.jev = client
-            yield
+        publisher = await start_publisher_from_env()
+        app.state.slim = publisher
+        try:
+            async with TypeSafeJevClient() as client:
+                app.state.jev = client
+                yield
+        finally:
+            if publisher is not None:
+                await publisher.aclose()
 
     app = FastAPI(title="Sherpa", lifespan=lifespan)
 
@@ -294,7 +313,7 @@ def create_app(jev: JevClient | None = None, log_path: Path = DEFAULT_LOG_PATH) 
     @app.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket) -> None:
         await ws.accept()
-        await Connection(ws, app.state.jev, log_path).run()
+        await Connection(ws, app.state.jev, log_path, app.state.slim).run()
 
     return app
 
