@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Editor from "@monaco-editor/react";
 import { PROBLEMS, type Problem } from "./problems";
-import { Socket } from "./socket";
-import AgentPanel, { applyMessage, emptyDeliberation, type Deliberation } from "./AgentPanel";
+import { Socket, type InMsg } from "./socket";
+import AgentPanel from "./AgentPanel";
+import { applyMessage, emptyDeliberation, type Deliberation } from "./deliberation";
+import { useRevealQueue } from "./useRevealQueue";
 
 type CaseResult = { ok: boolean; actual: string | null; error: string | null };
 type RunState = {
@@ -51,6 +53,8 @@ export default function App() {
   const [delib, setDelib] = useState<Deliberation>(emptyDeliberation);
 
   const problem = PROBLEMS[problemIndex];
+  const applyMsg = useCallback((m: InMsg) => setDelib((prev) => applyMessage(prev, m)), []);
+  const { push: pushMsg, clear: clearQueue } = useRevealQueue(applyMsg);
 
   const workerRef = useRef<Worker | null>(null);
   const timerRef = useRef<number | undefined>(undefined);
@@ -59,14 +63,19 @@ export default function App() {
   // Per-problem code and last-sent snapshot, so switching problems keeps your work
   const codesRef = useRef<Record<string, string>>({});
   const snapshotsRef = useRef<Record<string, string>>({});
+
+  // Callbacks and timers read the current problem from here. It is updated in an
+  // effect (not during render) so React's rules about refs are respected.
   const problemRef = useRef<Problem>(problem);
-  problemRef.current = problem;
+  useEffect(() => {
+    problemRef.current = problem;
+  }, [problem]);
 
   function currentCode(p: Problem) {
     return codesRef.current[p.id] ?? p.starter;
   }
 
-  function sendRunEvent(r: RunState) {
+  const sendRunEvent = useCallback((r: RunState) => {
     const p = problemRef.current;
     socketRef.current?.send({
       type: "run",
@@ -75,11 +84,10 @@ export default function App() {
       passed: verdictOf(r) === "Accepted",
       first_error: firstErrorOf(r, p),
     });
-  }
+  }, []);
 
-  function startWorker() {
+  const createWorker = useCallback(() => {
     workerRef.current?.terminate();
-    setReady(false);
     const w = new Worker("/pyodide-worker.js");
     w.onmessage = (e) => {
       if (e.data.ready) {
@@ -100,17 +108,18 @@ export default function App() {
       sendRunEvent(r);
     };
     workerRef.current = w;
-  }
+  }, [sendRunEvent]);
 
+  // Start Python once on load. (`ready` already starts as false.)
   useEffect(() => {
-    startWorker();
+    createWorker();
     return () => workerRef.current?.terminate();
-  }, []);
+  }, [createWorker]);
 
   useEffect(() => {
     const s = new Socket((m) => {
       console.log("recv", m);
-      setDelib((prev) => applyMessage(prev, m));
+      pushMsg(m);
     }, setConnected);
     socketRef.current = s;
     s.send({ type: "problem", ts: Date.now(), problem_id: problemRef.current.id });
@@ -139,9 +148,10 @@ export default function App() {
       window.clearInterval(interval);
       s.close();
     };
-  }, []);
+  }, [pushMsg]);
 
   function switchProblem(i: number) {
+    clearQueue();
     setProblemIndex(i);
     setRun(null);
     setSelected(0);
@@ -158,9 +168,10 @@ export default function App() {
       fnName: problem.fnName,
       cases: problem.cases,
     });
-    // Kill runaway code (e.g. infinite loops) after 5 seconds
+    // Kill runaway code (e.g. infinite loops) after 5 seconds, then restart Python
     timerRef.current = window.setTimeout(() => {
-      startWorker();
+      setReady(false);
+      createWorker();
       setRunning(false);
       const r: RunState = { timedOut: true, compileError: null, cases: [], stdout: "" };
       setRun(r);
@@ -252,7 +263,7 @@ export default function App() {
                 defaultValue={problem.starter}
                 theme="vs-dark"
                 onChange={(value) => {
-                  codesRef.current[problemRef.current.id] = value ?? "";
+                  codesRef.current[problem.id] = value ?? "";
                 }}
               />
             </div>
@@ -349,15 +360,12 @@ export default function App() {
         </div>
 
         <AgentPanel
-          d={delib}
-          onAskMore={() =>
-            socketRef.current?.send({
-              type: "ask_nudge",
-              ts: Date.now(),
-              problem_id: problemRef.current.id,
-            })
-          }
-        />
+  d={delib}
+  onAskMore={() => socketRef.current?.send({ type: "ask_nudge", ts: Date.now(), problem_id: problem.id })}
+  onChat={(text) =>
+    socketRef.current?.send({ type: "chat", ts: Date.now(), problem_id: problem.id, text })
+  }
+/>
       </div>
     </div>
   );
