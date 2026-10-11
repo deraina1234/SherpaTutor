@@ -1,30 +1,7 @@
 import { useState } from "react";
-import type { InMsg, Proposal } from "./socket";
-
-type DecisionMsg = Extract<InMsg, { type: "decision" }>;
-type HintMsg = Extract<InMsg, { type: "hint" }>;
-
-export type Deliberation = {
-  rounds: Record<number, Proposal[]>;
-  decision: DecisionMsg | null;
-  hint: HintMsg | null;
-};
-
-export const emptyDeliberation: Deliberation = { rounds: {}, decision: null, hint: null };
-
-// Round 0 starts a new deliberation; everything else adds to the current one.
-export function applyMessage(d: Deliberation, m: InMsg): Deliberation {
-  switch (m.type) {
-    case "round":
-      return m.round === 0
-        ? { rounds: { 0: m.proposals }, decision: null, hint: null }
-        : { ...d, rounds: { ...d.rounds, [m.round]: m.proposals } };
-    case "decision":
-      return { ...d, decision: m };
-    case "hint":
-      return { ...d, hint: m };
-  }
-}
+import type { Proposal } from "./socket";
+import type { Deliberation, DecisionMsg } from "./deliberation";
+import ChatBox from "./ChatBox";
 
 const AGENTS = [
   {
@@ -48,6 +25,19 @@ const AGENTS = [
 ];
 
 const LEVEL_NAMES = ["No help", "Nudge", "Conceptual hint", "Point to the area", "Near-solution"];
+
+const TAG_LABELS: Record<string, string> = {
+  repeated_error: "Same error repeating",
+  long_idle: "Idle for a while",
+  concept_gap: "Missing a concept",
+  solution_leak_risk: "Hint could give away the answer",
+  active_progress: "Making progress",
+  learner_requested_help: "Asked for help",
+  recent_hint_given: "Just got a hint",
+};
+
+const tagLabel = (t: string) =>
+  TAG_LABELS[t] ?? t.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
 
 const OUTCOMES: Record<string, { label: string; color: string }> = {
   consensus: { label: "Consensus", color: "#4ade80" },
@@ -81,7 +71,7 @@ function Ladder({ level, cap, color }: { level: number; cap: number | null; colo
               fontWeight: active ? 700 : 400,
               color: active ? "#111" : blocked ? "#666" : "#aaa",
               backgroundColor: active ? color : "#2f2f2f",
-              backgroundImage: blocked ? HATCH : "none",
+              backgroundImage: blocked && !active ? HATCH : "none",
               borderRight: atCap ? "2px solid #f87171" : "2px solid transparent",
               transition: "background-color 0.4s",
             }}
@@ -164,6 +154,8 @@ function AgentCard({
   cap: number | null;
 }) {
   const status = statusOf(entries);
+  const isIntegrity = meta.name === "Integrity";
+  const clamped = !isIntegrity && latest !== undefined && cap !== null && latest.level > cap;
   return (
     <div style={{ background: "#262626", borderRadius: 8, padding: 10, display: "grid", gap: 8 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -177,34 +169,63 @@ function AgentCard({
 
       {latest ? (
         <>
-          <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-            <span style={{ fontSize: 26, fontWeight: 700, color: meta.color, lineHeight: 1 }}>
-              L{latest.level}
-            </span>
-            <span style={{ fontSize: 12, color: "#ccc" }}>{LEVEL_NAMES[latest.level] ?? ""}</span>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+            {isIntegrity ? (
+              <>
+                <span style={{ fontSize: 20, fontWeight: 700, color: meta.color, lineHeight: 1 }}>
+                  Sets cap: L{cap ?? latest.level}
+                </span>
+                <span style={{ fontSize: 12, color: "#ccc" }}>
+                  {LEVEL_NAMES[cap ?? latest.level] ?? ""} at most
+                </span>
+              </>
+            ) : (
+              <>
+                <span style={{ fontSize: 26, fontWeight: 700, color: meta.color, lineHeight: 1 }}>
+                  L{latest.level}
+                </span>
+                <span style={{ fontSize: 12, color: "#ccc" }}>{LEVEL_NAMES[latest.level] ?? ""}</span>
+                {clamped && (
+                  <span
+                    title={`Integrity allows at most L${cap}, so this vote counts as L${cap}`}
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 600,
+                      padding: "1px 8px",
+                      borderRadius: 10,
+                      background: "#3b1d1d",
+                      color: "#f87171",
+                      border: "1px solid #7f2d2d",
+                    }}
+                  >
+                    clamped to L{cap}
+                  </span>
+                )}
+              </>
+            )}
           </div>
           <ConfidenceBar value={latest.confidence} color={meta.color} />
-          <Ladder level={latest.level} cap={cap} color={meta.color} />
+          <Ladder level={isIntegrity ? -1 : latest.level} cap={cap} color={meta.color} />
           {latest.tags.length > 0 && (
             <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
               {latest.tags.map((t) => (
                 <span
                   key={t}
+                  title={t}
                   style={{
-                    ...mono,
                     fontSize: 11,
-                    padding: "1px 7px",
+                    padding: "1px 8px",
                     borderRadius: 10,
                     background: "#333",
                     color: "#ccc",
                   }}
                 >
-                  {t}
+                  {tagLabel(t)}
                 </span>
               ))}
             </div>
           )}
-          <History entries={entries} color={meta.color} />
+          {!isIntegrity && <History entries={entries} color={meta.color} />}
         </>
       ) : (
         <div style={{ fontSize: 12, color: "#666" }}>Watching. No position yet.</div>
@@ -221,9 +242,11 @@ function AgentCard({
 export default function AgentPanel({
   d,
   onAskMore,
+  onChat,
 }: {
   d: Deliberation;
   onAskMore: () => void;
+  onChat: (text: string) => void;
 }) {
   // Remember which decision the learner already asked about, so the button only fires once per decision
   const [askedFor, setAskedFor] = useState<DecisionMsg | null>(null);
@@ -337,6 +360,8 @@ export default function AgentPanel({
           />
         );
       })}
+
+      <ChatBox onSend={onChat} />
     </div>
   );
 }
