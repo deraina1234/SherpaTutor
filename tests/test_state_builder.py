@@ -318,3 +318,10 @@ def test_run_snapshot_counts_as_the_edit_that_ran() -> None:
     assert b.code == fixed and b.solved()
     b.ingest(edit(14, fixed))  # the 5s edit timer resends the same code: still solved
     assert b.solved()
+
+
+def test_tasks_carry_the_problem_statement_from_the_frontend() -> None:
+    from state_builder import task_for
+
+    assert task_for("3sum").statement.startswith("3Sum: Return every unique triplet")
+    assert task_for("not-a-problem").statement == ""

@@ -42,7 +42,7 @@ export type Response = {
 };
 
 export type InMsg =
-  | { type: "round"; round: number; proposals: Proposal[] }
+  | { type: "round"; round: number; proposals: Proposal[]; trigger?: string } // trigger: why the agents met
   | { type: "decision"; outcome: string; level: number; explanation: string }
   | { type: "hint"; level: number; text: string };
 

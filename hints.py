@@ -3,12 +3,13 @@
 Per Section 10 of the Spotter design doc:
 - Hint writer: Receives code, error, agreed level, and reference solution policy.
   Generates a pedagogical hint strictly adhering to the agreed level (Levels 0-4).
-- Leak checking: When Jev and reference solution summary are provided, Jev verifies
-  the generated hint does not leak the solution. If a leak is detected (prob > 0.5),
-  it rewrites the hint at the same level with the leaked draft as a counterexample,
-  then one level lower, then falls back to template.
-- Explainer: Turns structured deliberation rounds, reason tags, and decisions into
-  2-3 plain-language sentences for the side panel.
+- Hint checking: When Jev is provided, it checks every hint twice: that it claims nothing
+  the code and test results don't show, and (given a reference solution summary) that it
+  does not leak the solution. A rejected hint is rewritten at the same level with the
+  rejected draft and the reason, then one level lower, then falls back to template.
+- Explainer: Code writes the first sentence (the test result) and the last (what Sherpa
+  does, at the level actually given). The LLM writes only the "why" in between, from a
+  list of deliberation facts; Jev checks it against them, else a template is used.
 - The LLM never decides whether to intervene; it only executes after the multi-agent
   deliberation finishes. During deliberation, complete_text() only words the agents'
   arguments (see agents.py); Jev checks those words and decides what they are worth.
@@ -21,6 +22,7 @@ reliability.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -200,62 +202,6 @@ def _offline_hint(code: str, error: str | None, help_level: int, last_passed: bo
     return None
 
 
-def _offline_explanation(decision: Decision, slices: dict[str, Any] | None = None) -> str:
-    """Generate a concise plain-English explanation of the decision when offline."""
-    outcome = decision.outcome
-    final_level = decision.final_level
-    rounds_count = decision.rounds_used
-
-    # Gather reason tags from round 0 proposals
-    tags: list[str] = []
-    if decision.rounds and decision.rounds[0]:
-        for p in decision.rounds[0]:
-            tags.extend(p.reason_tags)
-    unique_tags = list(dict.fromkeys(tags))
-
-    tag_desc = ""
-    if "repeated_error" in unique_tags:
-        tag_desc += "repeated test failures were detected, "
-    if "long_idle" in unique_tags:
-        tag_desc += "the learner was idle for an extended period, "
-    if "concept_gap" in unique_tags:
-        tag_desc += "a conceptual misunderstanding was identified, "
-    if "active_progress" in unique_tags:
-        tag_desc += "the learner was making active progress, "
-
-    if tag_desc:
-        tag_desc = f"Noting that {tag_desc.rstrip(', ')}, "
-
-    if outcome == OutcomeKind.CONSENSUS:
-        level_str = (
-            "to withhold help so you can continue exploring"
-            if final_level == 0
-            else f"to offer a Level {final_level} hint"
-        )
-        return (
-            f"{tag_desc}the agents deliberated for {rounds_count} round(s) and reached consensus {level_str}. "
-            f"Learning and Momentum agreed this level best supports your learning without interrupting your flow."
-        )
-    elif outcome == OutcomeKind.SOFT_DISAGREEMENT:
-        cap_note = " Integrity clamped higher assistance to protect the solution." if decision.cap_applied else ""
-        if final_level == 0 or final_level is None:
-            return (
-                f"{tag_desc}the agents had a soft disagreement between their proposals.{cap_note} "
-                "Per protocol, Sherpa chose the least intrusive action: no hint was given and you can ask for one when ready."
-            )
-        else:
-            return (
-                f"{tag_desc}the agents had a soft disagreement between their proposals.{cap_note} "
-                f"Per protocol, Sherpa chose the least intrusive action (Level {final_level}) to give you a light nudge first, "
-                "leaving you in control if you need more help."
-            )
-    else:  # DEADLOCK
-        return (
-            f"{tag_desc}the agents reached a deadlock after {rounds_count} rounds with conflicting views on intervention. "
-            "Rather than interrupting prematurely, Sherpa stayed silent. Feel free to request a nudge whenever you are ready."
-        )
-
-
 # ---------------------------------------------------------------------------
 # Core LLM Functions
 # ---------------------------------------------------------------------------
@@ -281,29 +227,32 @@ def _build_hint_prompt(
     reference_solution_summary: str | None = None,
     last_passed: bool | None = None,
     rejected_draft: str | None = None,
+    problem_statement: str | None = None,
+    rejected_reason: str = "leak",
 ) -> str:
     level_instructions = {
         HelpLevel.NUDGE: (
-            "Goal: Write a short NUDGE (1-2 sentences).\n"
-            "- Point the learner's attention to the symptom: which input gives which wrong result, or which error.\n"
-            "- Ask a guiding question about that symptom.\n"
-            "- DO NOT say what check, step, or case is missing, and DO NOT describe the fix.\n"
-            "- DO NOT explain the concept or algorithm.\n"
+            "Goal: Write a short NUDGE (1-2 sentences) about their APPROACH.\n"
+            "- Ask one guiding question about their strategy: what it costs, where it will struggle, or which "
+            "property of the problem it does not use yet. A failing test result can serve as evidence.\n"
+            "- DO NOT name the technique, data structure, or algorithm they should switch to, and DO NOT describe the fix.\n"
             "- DO NOT write or suggest code.\n"
-            "Example of a good nudge: \"Your function returns 5 for [3, 5, 5]. Walk through that input by hand: "
-            "at which step does your code's answer stop matching yours?\"\n"
-            "Example of a bad nudge (names the fix): \"You never skip duplicates of the maximum.\""
+            "- Ground the question in this student's code and this problem's input and output.\n"
+            "- If their approach is sound and only a detail is wrong, do not explain the detail or mention "
+            "where in the code it is. Use this shape, filled in from the test result: \"Your function returns "
+            "<wrong result> for <input>. Walk through that input by hand: where does it stop doing what you expect?\"\n"
+            "Example of a bad nudge (names the technique): \"Use a sliding window with a set of characters.\""
         ),
         HelpLevel.CONCEPTUAL_HINT: (
-            "Goal: Write a CONCEPTUAL HINT (1-3 sentences).\n"
-            "- Explain the core programming concept, algorithm invariant, or mental model they are missing.\n"
-            "- Use plain English explanation.\n"
-            "- DO NOT write code snippets or give away line numbers."
+            "Goal: Write a CONCEPTUAL HINT (1-3 sentences) about their APPROACH.\n"
+            "- Explain the idea their approach is missing and why it fits this problem, e.g. what a property of "
+            "the input (sorted order, a running total, a bound) would let them skip or reuse.\n"
+            "- Use plain English. DO NOT write code, pseudo-code, or a step-by-step algorithm, or give line numbers."
         ),
         HelpLevel.POINT_TO_AREA: (
             "Goal: POINT TO THE AREA (1-3 sentences).\n"
-            "- Point out the specific line, loop, or conditional where their bug occurs.\n"
-            "- Explain what is happening on that line vs what was intended.\n"
+            "- Point out the specific loop, line, or conditional where their approach goes wrong or wastes work.\n"
+            "- Explain what that part does vs what the approach needs it to do.\n"
             "- DO NOT provide the complete replacement code."
         ),
         HelpLevel.NEAR_SOLUTION: (
@@ -321,20 +270,33 @@ def _build_hint_prompt(
             f"\"{reference_solution_summary}\"\n"
             f"Never reveal the full answer directly."
         )
-    if rejected_draft:
+    if rejected_draft and rejected_reason == "ungrounded":
+        reference_constraint += (
+            f"\nA previous draft claimed something the code and test results do not show and was rejected:\n"
+            f"\"{rejected_draft}\"\n"
+            "Write a new hint that states only what the code and test results below actually show."
+        )
+    elif rejected_draft:
         reference_constraint += (
             f"\nA previous draft gave away too much of the fix and was rejected:\n\"{rejected_draft}\"\n"
-            "Write a new hint that reveals less: describe the symptom and ask a question, "
-            "without naming the missing check, the step to add, or the fix."
+            "Write a new hint that reveals less: ask a question about their approach, "
+            "without naming the technique, the missing check, the step to add, or the fix."
         )
 
+    problem = f"PROBLEM:\n{problem_statement}\n\n" if problem_statement else ""
     return (
         "You are an encouraging, pedagogical AI programming tutor helping a student.\n"
+        "Hints are about the student's APPROACH: first judge whether their overall strategy can solve the "
+        "problem correctly and efficiently, then aim the hint at the idea they are missing. Mention a small "
+        "mechanical slip only if the approach is already sound.\n"
+        "If the code looks unfinished and has not been run (for example no return statement yet), the student "
+        "is still typing: do not point out what is missing; talk about the approach.\n"
         f"{instructions}\n"
         f"{reference_constraint}\n\n"
+        f"{problem}"
         f"STUDENT CODE:\n```python\n{code}\n```\n\n"
         f"{_run_result_text(error, last_passed)}\n\n"
-        "Only mention a problem you can point to in the code or the test results above. "
+        "Only claim a bug you can point to in the code or the test results above. "
         "Never invent a bug (such as an indentation or syntax problem) that is not there.\n"
         "Respond with ONLY the hint text. Keep it concise, friendly, and pedagogically sound."
     )
@@ -435,14 +397,14 @@ def _build_explainer_prompt(decision: Decision, slices: dict[str, Any] | None = 
         f"Rule applied: {_STOP_RULES[decision.outcome]}\n"
         f"{cap_text}\n"
         f"Result: {result}\n\n"
-        "Write 2-3 plain, friendly sentences to the student (\"you\") explaining why the agents landed here. "
+        "Write 1-2 plain, friendly sentences to the student (\"you\") explaining WHY the agents landed here. "
+        "Do not restate the test result or the Result: Sherpa writes those sentences itself, before and after yours. "
         + (
-            "Start from the test result: every test passed, which is why no hint was needed. "
+            "Every test passed. "
             if passed
-            else "Start from the test result: the code still fails, so never say the tests passed or that no help was needed. "
+            else "The code still fails, so never say the tests passed or that no help was needed. "
         )
         + "Use only the facts above. Do not invent reasons, agreements, feelings, or a cap that was not applied. "
-        "End by stating the Result above, and never contradict it (if Sherpa gives a hint, do not say no hint was needed). "
         "Do not claim an agent voted a level because of a signal that points the other way "
         "(for example, no help because you asked for help), "
         "and do not describe Integrity as voting or siding with anyone."
@@ -458,12 +420,16 @@ async def _generate_raw_hint(
     model: str,
     last_passed: bool | None = None,
     rejected_draft: str | None = None,
+    problem_statement: str | None = None,
+    rejected_reason: str = "leak",
 ) -> tuple[str, bool]:
     """Generate raw hint text. Returns (text, from_llm)."""
     if help_level == HelpLevel.NONE:
         return "", False
 
-    prompt = _build_hint_prompt(code, error, help_level, reference_solution_summary, last_passed, rejected_draft)
+    prompt = _build_hint_prompt(
+        code, error, help_level, reference_solution_summary, last_passed, rejected_draft, problem_statement, rejected_reason
+    )
     nemotron_text = await _nemotron_complete(prompt)
     if nemotron_text:
         logger.info("Hint L%d written by Nemotron.", help_level)
@@ -502,6 +468,7 @@ async def write_hint_async(
     model: str = DEFAULT_GEMINI_MODEL,
     jev: JevClient | None = None,
     last_passed: bool | None = None,
+    problem_statement: str | None = None,
 ) -> HintResult:
     """Generate a pedagogical hint using Gemini with Jev leak verification.
 
@@ -515,6 +482,7 @@ async def write_hint_async(
         jev: Optional JevClient for verifying hints against reference solution leaks.
         last_passed: Whether the learner's last run passed (None if never run), so the
             writer never invents a bug in passing code.
+        problem_statement: The problem as the learner sees it, so the hint can judge their approach.
     """
     if help_level == HelpLevel.NONE:
         return HintResult(text=None, level=HelpLevel.NONE, verified=False, downgraded=False)
@@ -527,18 +495,25 @@ async def write_hint_async(
         api_key=api_key,
         model=model,
         last_passed=last_passed,
+        problem_statement=problem_statement,
     )
 
-    if jev is None or not reference_solution_summary:
+    if jev is None:
         return HintResult(text=candidate, level=help_level, verified=False, downgraded=False)
 
-    if not await _leaks(jev, candidate, reference_solution_summary):
+    async def problem_with(hint: str) -> str | None:
+        return await _hint_problem(jev, hint, code, error, last_passed, problem_statement, reference_solution_summary)
+
+    problem = await problem_with(candidate)
+    if problem is None:
         return HintResult(text=candidate, level=help_level, verified=True, downgraded=False)
 
-    # Leak detected. Rewrite at the same level with the leaked draft as a counterexample,
-    # then one level lower (stopping at a nudge), then fall back to the template.
+    # Rejected. Rewrite at the same level with the rejected draft and the reason as a
+    # counterexample, then one level lower (stopping at a nudge), then fall back to the template.
     retries = [help_level] + ([help_level - 1] if help_level > HelpLevel.NUDGE else [])
+    rejected = candidate
     for level in retries:
+        logger.info("Hint L%d draft rejected (%s); rewriting at L%d: %s", help_level, problem, level, rejected)
         retry, _ = await _generate_raw_hint(
             code=code,
             error=error,
@@ -547,12 +522,18 @@ async def write_hint_async(
             api_key=api_key,
             model=model,
             last_passed=last_passed,
-            rejected_draft=candidate,
+            rejected_draft=rejected,
+            rejected_reason=problem,
+            problem_statement=problem_statement,
         )
-        if retry and not await _leaks(jev, retry, reference_solution_summary):
+        if not retry:
+            continue
+        retry_problem = await problem_with(retry)
+        if retry_problem is None:
             return HintResult(text=retry, level=level, verified=True, downgraded=level < help_level)
+        rejected, problem = retry, retry_problem
 
-    logger.info("Every hint draft leaked the solution; using the template hint.")
+    logger.info("Every hint draft was rejected (last: %s, %s); using the template hint.", problem, rejected)
     return HintResult(
         text=_offline_hint(code, error, help_level, last_passed),
         level=help_level,
@@ -567,10 +548,140 @@ _LEAK_QUESTION = (
 )
 LEAK_PROBABILITY = 0.5  # a hint judged above this leaks the solution
 
+_UNGROUNDED_QUESTION = (
+    "Does `hint` claim something about the student's code or its results that `code` and "
+    "`run_result` do not show, such as a bug, an output value, an error, or a line that is not "
+    "there? Judgments about the approach's speed or strategy are not claims of this kind."
+)
+UNGROUNDED_PROBABILITY = 0.5  # a hint judged above this states something the code and results don't show
 
-async def _leaks(jev: JevClient, hint: str, reference_solution_summary: str) -> bool:
-    check = await jev.noul({"hint": hint, "reference_solution_summary": reference_solution_summary}, _LEAK_QUESTION)
-    return check.probability > LEAK_PROBABILITY
+# Hint rejection reasons, also used to word the rewrite request in _build_hint_prompt.
+LEAK = "leak"
+UNGROUNDED = "ungrounded"
+
+
+async def _hint_problem(
+    jev: JevClient,
+    hint: str,
+    code: str,
+    error: str | None,
+    last_passed: bool | None,
+    problem_statement: str | None,
+    reference_solution_summary: str | None,
+) -> str | None:
+    """LEAK, UNGROUNDED, or None when Jev finds the hint both safe and true to the code and results."""
+    grounding_state = {
+        "hint": hint,
+        "problem": problem_statement or "",
+        "code": code,
+        "run_result": _run_result_text(error, last_passed),
+    }
+    checks = [jev.noul(grounding_state, _UNGROUNDED_QUESTION)]
+    if reference_solution_summary:
+        checks.append(jev.noul({"hint": hint, "reference_solution_summary": reference_solution_summary}, _LEAK_QUESTION))
+    results = await asyncio.gather(*checks)
+    if len(results) > 1 and results[1].probability > LEAK_PROBABILITY:
+        return LEAK
+    if results[0].probability > UNGROUNDED_PROBABILITY:
+        return UNGROUNDED
+    return None
+
+
+_WHY_CHECK_QUESTION = (
+    "Does `explanation` state anything that `facts` do not support, or contradict `run_result`, "
+    "`rule`, or `result`?"
+)
+WHY_CHECK_PROBABILITY = 0.5  # an explanation judged above this is replaced by the template
+
+
+def _last_run(slices: dict[str, Any] | None) -> dict[str, Any]:
+    return ((slices or {}).get("learning") or {}).get("last_run") or {}
+
+
+def _opening(slices: dict[str, Any] | None) -> str:
+    """First sentence, written by code: the test result."""
+    if slices is None:
+        return ""
+    last_run = _last_run(slices)
+    if last_run.get("passed"):
+        return "Your tests all pass."
+    if last_run.get("error"):
+        return f"Your latest run failed: {str(last_run['error']).rstrip('.')}."
+    if last_run.get("passed") is False:
+        return "Your latest run failed."
+    return "You haven't run your code yet."
+
+
+def _closing(decision: Decision, given_level: int | None = None) -> str:
+    """Last sentence, written by code: what Sherpa actually does, at the level actually given."""
+    if decision.final_level is None:
+        return "So there is no automatic hint; ask for a nudge whenever you want one."
+    level = decision.final_level if given_level is None else given_level
+    if level == 0:
+        return "So Sherpa is holding back for now; you can ask for help any time."
+    if level < decision.final_level:
+        return (
+            f"So Sherpa is giving you {_level_name(level)}, a step lighter than the agents chose, "
+            "because the stronger hint did not pass Sherpa's checks."
+        )
+    return f"So Sherpa is giving you {_level_name(level)}."
+
+
+def _join(items: list[str]) -> str:
+    # Semicolons, since an item may contain a comma ("a concept, not just making a slip").
+    return items[0] if len(items) == 1 else f"{'; '.join(items[:-1])}; and {items[-1]}"
+
+
+def _template_why(decision: Decision) -> str:
+    """The middle of the explanation without an LLM: what the agents noticed and the rule applied."""
+    signals: list[str] = []
+    for position in decision.rounds[0] if decision.rounds else []:
+        if position.cap is not None:
+            continue
+        for tag in position.reason_tags:
+            text = _CLAIM_TEXT.get(tag)
+            if text and text not in signals:
+                signals.append(text)
+    parts = [f"The agents noticed that {_join(signals)}."] if signals else []
+    parts.append(_STOP_RULES[decision.outcome])
+    if decision.cap_applied:
+        parts.append("Integrity's ceiling lowered a vote that asked for more help.")
+    return " ".join(parts)
+
+
+async def explain_why_async(
+    decision: Decision,
+    slices: dict[str, Any] | None = None,
+    api_key: str | None = None,
+    model: str = DEFAULT_GEMINI_MODEL,
+    jev: JevClient | None = None,
+) -> str:
+    """The "why" sentences: an LLM's, if Jev finds them true to the facts, else the template's."""
+    why = await complete_text(_build_explainer_prompt(decision, slices), api_key, model)
+    if not why:
+        logger.warning("Falling back to template explanation: no LLM answered.")
+        return _template_why(decision)
+    if jev is not None:
+        state = {
+            "explanation": why,
+            "run_result": _opening(slices) or "unknown",
+            "facts": _deliberation_facts(decision),
+            "rule": _STOP_RULES[decision.outcome],
+            "result": _closing(decision),
+        }
+        check = await jev.noul(state, _WHY_CHECK_QUESTION)
+        if check.probability > WHY_CHECK_PROBABILITY:
+            logger.info("Explanation rejected by Jev (%.2f); using the template: %s", check.probability, why)
+            return _template_why(decision)
+    logger.info("Explanation written by the LLM.")
+    return why
+
+
+def frame_explanation(
+    why: str, decision: Decision, slices: dict[str, Any] | None = None, given_level: int | None = None
+) -> str:
+    """Code-written test result, then the why, then the code-written outcome at the level given."""
+    return " ".join(part for part in (_opening(slices), why.strip(), _closing(decision, given_level)) if part)
 
 
 async def explain_deliberation_async(
@@ -578,36 +689,12 @@ async def explain_deliberation_async(
     slices: dict[str, Any] | None = None,
     api_key: str | None = None,
     model: str = DEFAULT_GEMINI_MODEL,
+    jev: JevClient | None = None,
+    given_level: int | None = None,
 ) -> str:
-    """Explain the deliberation in plain language: Nemotron, then Gemini, then a template."""
-    prompt = _build_explainer_prompt(decision, slices)
-    nemotron_text = await _nemotron_complete(prompt)
-    if nemotron_text:
-        logger.info("Explanation written by Nemotron.")
-        return nemotron_text
-
-    key = _get_api_key(api_key)
-    if not key:
-        logger.warning("Falling back to template explanation: GEMINI_API_KEY is not set.")
-        return _offline_explanation(decision, slices)
-
-    try:
-        from google import genai
-
-        client = genai.Client(api_key=key)
-        response = await client.aio.models.generate_content(
-            model=model,
-            contents=prompt,
-        )
-        text = response.text
-        if text:
-            logger.info("Explanation written by Gemini.")
-            return text.strip()
-        logger.warning("Falling back to template explanation: Gemini response was empty.")
-        return _offline_explanation(decision, slices)
-    except Exception as err:
-        logger.warning("Falling back to template explanation due to %s: %s", type(err).__name__, err)
-        return _offline_explanation(decision, slices)
+    """Explain the deliberation in plain language. See explain_why_async and frame_explanation."""
+    why = await explain_why_async(decision, slices, api_key, model, jev)
+    return frame_explanation(why, decision, slices, given_level)
 
 
 def write_hint(
@@ -619,10 +706,9 @@ def write_hint(
     model: str = DEFAULT_GEMINI_MODEL,
     jev: JevClient | None = None,
     last_passed: bool | None = None,
+    problem_statement: str | None = None,
 ) -> HintResult:
     """Synchronous wrapper for write_hint_async."""
-    import asyncio
-
     return asyncio.run(
         write_hint_async(
             code=code,
@@ -633,6 +719,7 @@ def write_hint(
             model=model,
             jev=jev,
             last_passed=last_passed,
+            problem_statement=problem_statement,
         )
     )
 
@@ -644,8 +731,6 @@ def explain_deliberation(
     model: str = DEFAULT_GEMINI_MODEL,
 ) -> str:
     """Synchronous wrapper for explain_deliberation_async."""
-    import asyncio
-
     return asyncio.run(
         explain_deliberation_async(
             decision=decision,

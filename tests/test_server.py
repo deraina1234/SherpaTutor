@@ -134,7 +134,7 @@ def test_server_runs_jev_leak_check_on_hints(tmp_path) -> None:
         ws.send_json(event("problem"))
         ws.send_json(event("ask_nudge"))
         assert ws.receive_json()["type"] == "hint"
-    leak_checks = [state for kind, state, _ in jev.calls if kind == "noul" and "hint" in state]
+    leak_checks = [state for kind, state, _ in jev.calls if kind == "noul" and "reference_solution_summary" in state]
     assert leak_checks and leak_checks[0]["reference_solution_summary"] == SECRET
 
 
@@ -199,3 +199,29 @@ def test_agents_word_their_arguments_when_the_app_has_a_writer(tmp_path) -> None
     assert by_agent["learning"]["arguments"] == [{"claim": "concept_gap", "text": "Case 2 returns 5 where 4 is expected."}]
     assert "arguments" not in by_agent["integrity"]
     assert all("reference_solution_summary" not in prompt for prompt in prompts)
+
+
+class RecordingWebSocket:
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send_json(self, message: dict) -> None:
+        self.sent.append(message)
+
+
+@pytest.mark.parametrize("demo", [False, True])
+def test_heartbeats_reach_the_browser_only_in_demo_mode(tmp_path, demo: bool) -> None:
+    from server import Connection
+    from state_builder import Trigger
+
+    ws = RecordingWebSocket()
+    conn = Connection(ws, FakeJevClient(score_value=0, noul_probability=0.1), tmp_path / "s.jsonl", demo=demo)  # type: ignore[arg-type]
+    conn.session.ingest(event("problem", seconds_ago=60))
+    asyncio.run(conn._deliberate(Trigger.HEARTBEAT, PID))
+
+    if not demo:
+        assert ws.sent == []  # a no-help check-in stays in the background
+        return
+    assert [m["type"] for m in ws.sent] == ["round", "decision"]
+    assert ws.sent[0]["trigger"] == "heartbeat"
+    assert ws.sent[1]["level"] == 0

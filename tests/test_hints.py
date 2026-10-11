@@ -59,10 +59,11 @@ def test_offline_explanation_consensus() -> None:
         ask_learner=False,
         rounds_used=1,
     )
-    exp = explain_deliberation(decision, api_key="")
-    assert "consensus" in exp
-    assert "Level 2" in exp
-    assert "concept" in exp
+    exp = explain_deliberation(decision, {"learning": {"last_run": {"passed": False, "error": "Case 2: expected 4, got 5"}}}, api_key="")
+    assert exp.startswith("Your latest run failed: Case 2: expected 4, got 5.")
+    assert "The agents noticed that you seem to be missing a concept" in exp
+    assert "voted the same level" in exp
+    assert exp.endswith("So Sherpa is giving you a conceptual hint.")
 
 
 def test_offline_explanation_soft_disagreement_level_1() -> None:
@@ -78,14 +79,14 @@ def test_offline_explanation_soft_disagreement_level_1() -> None:
         rounds_used=2,
     )
     exp = explain_deliberation(decision, api_key="")
-    assert "soft disagreement" in exp
-    assert "least intrusive" in exp
-    assert "Level 1" in exp
-    assert "Integrity clamped" in exp
+    assert "the same error keeps coming back" in exp
+    assert "less intrusive level" in exp
+    assert "Integrity's ceiling lowered a vote" in exp
+    assert exp.endswith("So Sherpa is giving you a nudge.")
 
 
 def test_offline_explanation_soft_disagreement_level_0() -> None:
-    # Level 0 soft disagreement must state that no hint was given and the learner can ask for one
+    # Level 0 must state that no hint was given and the learner can ask for one
     decision = Decision(
         outcome=OutcomeKind.SOFT_DISAGREEMENT,
         final_level=0,
@@ -97,11 +98,10 @@ def test_offline_explanation_soft_disagreement_level_0() -> None:
         ask_learner=False,
         rounds_used=2,
     )
-    exp = explain_deliberation(decision, api_key="")
-    assert "soft disagreement" in exp
-    assert "no hint was given" in exp
-    assert "ask for one" in exp
-    assert "light nudge" not in exp
+    exp = explain_deliberation(decision, {"learning": {"last_run": {"passed": True, "error": None}}}, api_key="")
+    assert exp.startswith("Your tests all pass.")
+    assert exp.endswith("So Sherpa is holding back for now; you can ask for help any time.")
+    assert "nudge" not in exp
 
 
 def test_offline_explanation_deadlock() -> None:
@@ -113,9 +113,40 @@ def test_offline_explanation_deadlock() -> None:
         ask_learner=True,
         rounds_used=1,
     )
-    exp = explain_deliberation(decision, api_key="")
-    assert "deadlock" in exp
-    assert "stayed silent" in exp
+    exp = explain_deliberation(decision, {"learning": {"last_run": {"passed": None, "error": None}}}, api_key="")
+    assert exp.startswith("You haven't run your code yet.")
+    assert "two or more levels apart" in exp
+    assert exp.endswith("ask for a nudge whenever you want one.")
+
+
+def test_explanation_closing_states_the_level_actually_given() -> None:
+    from hints import frame_explanation
+
+    decision = Decision(OutcomeKind.CONSENSUS, 2, [[make_pos("learning", 0, 2), make_pos("momentum", 0, 2)]], False, False, 1)
+    downgraded = frame_explanation("Both agents agreed.", decision, None, given_level=1)
+    assert downgraded == (
+        "Both agents agreed. So Sherpa is giving you a nudge, a step lighter than the agents chose, "
+        "because the stronger hint did not pass Sherpa's checks."
+    )
+
+
+def test_jev_replaces_an_explanation_that_contradicts_the_facts() -> None:
+    from hints import explain_why_async
+
+    decision = Decision(OutcomeKind.CONSENSUS, 1, [[make_pos("learning", 0, 1, tags=["concept_gap"]), make_pos("momentum", 0, 1)]], False, False, 1)
+    slices = {"learning": {"last_run": {"passed": False, "error": "Case 4 failed"}}}
+
+    async def run(probability: float) -> tuple[str, FakeJevClient]:
+        jev = FakeJevClient(noul_probability=probability)
+        with patch("hints.complete_text", AsyncMock(return_value="Since all your tests passed, no hint was needed.")):
+            return await explain_why_async(decision, slices, jev=jev), jev
+
+    rejected, jev = asyncio.run(run(0.9))
+    assert rejected.startswith("The agents noticed that you seem to be missing a concept")
+    state = jev.calls[0][1]
+    assert state["run_result"] == "Your latest run failed: Case 4 failed." and state["result"] == "So Sherpa is giving you a nudge."
+    kept, _ = asyncio.run(run(0.1))
+    assert kept == "Since all your tests passed, no hint was needed."
 
 
 def test_fallback_logs_warning_on_missing_key(caplog: pytest.LogCaptureFixture) -> None:
@@ -185,21 +216,26 @@ def test_jev_verification_passes_with_safe_hint() -> None:
     assert hint.verified is True
     assert hint.downgraded is False
     assert hint.level == HelpLevel.CONCEPTUAL_HINT
-    assert len(jev.calls) == 1
-    assert jev.calls[0][0] == "noul"
-    assert "Does `hint` reveal the approach" in jev.calls[0][2]
+    questions = sorted(question for _, _, question in jev.calls)
+    assert len(questions) == 2  # one leak check, one grounding check
+    assert "Does `hint` claim something" in questions[0] and "Does `hint` reveal the approach" in questions[1]
 
 
 class ScriptedLeakJev(FakeJevClient):
-    """Leak checks return the given probabilities in order."""
+    """Leak and grounding checks each return their scripted probabilities in order (default 0.1)."""
 
-    def __init__(self, probabilities: list[float]) -> None:
+    def __init__(self, leak: list[float], ungrounded: list[float] | None = None) -> None:
         super().__init__()
-        self.probabilities = probabilities
+        self.leak, self.ungrounded = list(leak), list(ungrounded or [])
 
     async def noul(self, state: dict, question: str) -> JevNoul:
         self.calls.append(("noul", state, question))
-        return JevNoul(probability=self.probabilities[len(self.calls) - 1], confidence=0.9)
+        script = self.leak if "reference_solution_summary" in state else self.ungrounded
+        return JevNoul(probability=script.pop(0) if script else 0.1, confidence=0.9)
+
+
+def leak_checks(jev: FakeJevClient) -> int:
+    return sum(1 for _, state, _ in jev.calls if "reference_solution_summary" in state)
 
 
 @pytest.mark.parametrize(
@@ -210,7 +246,7 @@ def test_jev_verification_rewrites_leaked_hint_then_downgrades(
     probabilities: list[float], level: int, downgraded: bool
 ) -> None:
     jev = ScriptedLeakJev(probabilities)
-    with patch("hints._generate_raw_hint", AsyncMock(side_effect=lambda **kw: (f"draft {len(jev.calls)}", True))) as gen:
+    with patch("hints._generate_raw_hint", AsyncMock(side_effect=lambda **kw: (f"draft {leak_checks(jev)}", True))) as gen:
         hint = write_hint(
             code="nums = [1, 2]",
             error="IndexError",
@@ -220,9 +256,29 @@ def test_jev_verification_rewrites_leaked_hint_then_downgrades(
             jev=jev,
         )
     assert (hint.verified, hint.level, hint.downgraded) == (True, level, downgraded)
-    assert len(jev.calls) == len(probabilities)
-    # Every rewrite is shown the first leaked draft so it can avoid it.
-    assert all(call.kwargs["rejected_draft"] == "draft 0" for call in gen.call_args_list[1:])
+    assert leak_checks(jev) == len(probabilities)
+    # Each rewrite is shown the draft rejected just before it, and why.
+    rewrites = gen.call_args_list[1:]
+    assert [call.kwargs["rejected_draft"] for call in rewrites] == [f"draft {i}" for i in range(len(rewrites))]
+    assert all(call.kwargs["rejected_reason"] == "leak" for call in rewrites)
+
+
+def test_jev_verification_rewrites_an_ungrounded_hint() -> None:
+    jev = ScriptedLeakJev(leak=[], ungrounded=[0.9])  # first draft invents a bug; the rewrite is fine
+    drafts = iter(["Your indentation is wrong on line 2.", "Your function returns 3 for [1, 2]."])
+    with patch("hints._generate_raw_hint", AsyncMock(side_effect=lambda **kw: (next(drafts), True))) as gen:
+        hint = write_hint("def f(): pass", "Case 1: expected 2, got 3", HelpLevel.NUDGE, "summary", api_key="", jev=jev)
+    assert (hint.text, hint.level, hint.verified, hint.downgraded) == ("Your function returns 3 for [1, 2].", 1, True, False)
+    assert gen.call_args_list[1].kwargs["rejected_reason"] == "ungrounded"
+    grounding = [state for _, state, _ in jev.calls if "run_result" in state]
+    assert grounding[0]["code"] == "def f(): pass" and "expected 2, got 3" in grounding[0]["run_result"]
+
+
+def test_ungrounded_rejection_reason_goes_into_the_prompt() -> None:
+    from hints import _build_hint_prompt
+
+    prompt = _build_hint_prompt("code", "err", HelpLevel.NUDGE, "summary", False, "bad draft", None, "ungrounded")
+    assert "bad draft" in prompt and "do not show" in prompt and "reveals less" not in prompt
 
 
 def test_rejected_draft_goes_into_the_prompt() -> None:
@@ -317,3 +373,14 @@ def test_explainer_prompt_quotes_the_agents_written_arguments() -> None:
 
     assert 'Momentum argued: "No edits for 240 seconds."' in prompt
     assert 'rejected Momentum\'s point that you had stopped editing for a while. It said: "They ran the tests 40 seconds ago."' in prompt
+
+
+def test_hint_prompt_includes_the_problem_and_asks_about_the_approach() -> None:
+    from hints import _build_hint_prompt
+
+    prompt = _build_hint_prompt(
+        "def three_sum(nums):\n    pass\n", None, HelpLevel.NUDGE, "secret", None, problem_statement="3Sum: Return every triplet."
+    )
+    assert "PROBLEM:\n3Sum: Return every triplet." in prompt
+    assert "APPROACH" in prompt and "still typing" in prompt
+    assert "PROBLEM:" not in _build_hint_prompt("x = 1", None, HelpLevel.NUDGE)

@@ -41,15 +41,20 @@ Stdlib only, Python 3.11+.
 from __future__ import annotations
 
 import difflib
+import json
+import logging
 import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from contracts import HelpLevel, HintRecord, IntegritySlice, LastRun, LearningSlice, MomentumSlice
 from redaction import strip_secret_fields
+
+log = logging.getLogger("sherpa.state")
 
 # ---------------------------------------------------------------------------
 # Tunable thresholds. Starting guesses; adjust on recorded sessions.
@@ -84,6 +89,7 @@ class TaskInfo:
     task_id: str
     reference_solution_summary: str
     policy_max_level: int = HelpLevel.POINT_TO_AREA
+    statement: str = ""  # the problem as the learner sees it (title and description); not secret
 
 
 # Keyed by the frontend problem id (frontend/src/problems.ts). Integrity is the only agent
@@ -184,7 +190,29 @@ _SOLUTIONS: dict[str, str] = {
     ),
 }
 
-TASKS: dict[str, TaskInfo] = {pid: TaskInfo(pid, summary) for pid, summary in _SOLUTIONS.items()}
+PROBLEMS_FILE = Path(__file__).resolve().parent / "frontend" / "src" / "problems.ts"
+
+
+def _load_statements(path: Path = PROBLEMS_FILE) -> dict[str, str]:
+    """Problem id -> "Title: description", read from the frontend's problem list.
+
+    The PROBLEMS array in problems.ts is plain JSON, so the frontend stays the one
+    source of problem text. Returns {} (hints then go without a statement) if it can't be read.
+    """
+    try:
+        body = path.read_text(encoding="utf-8").split("export const PROBLEMS: Problem[] = ", 1)[1]
+        problems = json.loads(body.strip().rstrip(";"))
+        return {p["id"]: f"{p['title']}: {p['description']}" for p in problems}
+    except Exception as err:  # noqa: BLE001 - statements improve hints but are not required
+        log.warning("Could not read problem statements from %s (%s: %s)", path, type(err).__name__, err)
+        return {}
+
+
+_STATEMENTS = _load_statements()
+
+TASKS: dict[str, TaskInfo] = {
+    pid: TaskInfo(pid, summary, statement=_STATEMENTS.get(pid, "")) for pid, summary in _SOLUTIONS.items()
+}
 
 
 def task_for(problem_id: str | None) -> TaskInfo:
@@ -195,6 +223,7 @@ def task_for(problem_id: str | None) -> TaskInfo:
         task_id=problem_id or "unknown",
         reference_solution_summary="Unknown task: no reference solution available.",
         policy_max_level=HelpLevel.CONCEPTUAL_HINT,
+        statement=_STATEMENTS.get(problem_id or "", ""),
     )
 
 

@@ -39,6 +39,15 @@ const TAG_LABELS: Record<string, string> = {
 const tagLabel = (t: string) =>
   TAG_LABELS[t] ?? t.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
 
+// Why the agents met, shown above the deliberation.
+const TRIGGERS: Record<string, string> = {
+  heartbeat: "Check-in while you work",
+  failed_run: "Your run failed",
+  long_idle: "You went idle",
+  learner_message: "You sent a message",
+  ask_nudge: "You asked for a nudge",
+};
+
 const OUTCOMES: Record<string, { label: string; color: string }> = {
   consensus: { label: "Consensus", color: "#4ade80" },
   soft_disagreement: { label: "Soft disagreement", color: "#fbbf24" },
@@ -327,6 +336,11 @@ export default function AgentPanel({
               : "Watching"}
         </span>
       </div>
+      {d.trigger && (
+        <div style={{ fontSize: 12, color: "#999", marginTop: -6 }}>
+          Why they met: <span style={{ color: "#ddd" }}>{TRIGGERS[d.trigger] ?? d.trigger}</span>
+        </div>
+      )}
 
       {outcome && d.decision && (
         <div

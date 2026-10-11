@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import uuid
 from collections.abc import AsyncIterator, Coroutine
 from pathlib import Path
@@ -28,7 +29,7 @@ from agents import IntegrityAgent, LearningAgent, MomentumAgent, Writer
 from agntcy_slim import FanoutBus, Publisher, start_publisher_from_env
 from contracts import HelpLevel, JevClient
 from deliberation import InProcBus, run_deliberation
-from hints import ALL_TESTS_PASS_TEXT, complete_text, explain_deliberation_async, write_hint_async
+from hints import ALL_TESTS_PASS_TEXT, complete_text, explain_why_async, frame_explanation, write_hint_async
 from jev import TypeSafeJevClient, _load_env_file
 from logger import log_deliberation
 from redaction import redact, secret_values
@@ -37,8 +38,13 @@ from state_builder import Session, Trigger, task_for
 ROOT = Path(__file__).resolve().parent
 DEFAULT_LOG_PATH = ROOT / "logs" / "sessions.jsonl"
 TICK_SECONDS = 1.0
-# Background check-ins only reach the browser when they decide to help.
+# Background check-ins only reach the browser when they decide to help, except in demo mode.
 SILENT_TRIGGERS = {Trigger.HEARTBEAT}
+DEMO_ENV = "SHERPA_DEMO"  # "1" streams every deliberation, background check-ins included
+
+
+def demo_mode() -> bool:
+    return os.getenv(DEMO_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 log = logging.getLogger("sherpa.server")
 
@@ -81,13 +87,16 @@ def to_proposal(position: dict[str, Any]) -> dict[str, Any]:
     return proposal
 
 
-def round_message(bus_message: dict[str, Any]) -> dict[str, Any]:
+def round_message(bus_message: dict[str, Any], trigger: str | None = None) -> dict[str, Any]:
     """A deliberation/round/N bus message -> socket.ts {type: "round"}."""
-    return {
+    message = {
         "type": "round",
         "round": bus_message["round"],
         "proposals": [to_proposal(p) for p in bus_message["positions"]],
     }
+    if trigger is not None:
+        message["trigger"] = trigger  # why the agents met, e.g. "failed_run" or "heartbeat"
+    return message
 
 
 def nudge_level(last_hint_level: int | None, cap: int) -> int:
@@ -112,9 +121,16 @@ def _hint(result: Any, requested_level: int) -> tuple[str | None, int]:
 
 class Connection:
     def __init__(
-        self, ws: WebSocket, jev: JevClient, log_path: Path, slim: Publisher | None = None, writer: Writer | None = None
+        self,
+        ws: WebSocket,
+        jev: JevClient,
+        log_path: Path,
+        slim: Publisher | None = None,
+        writer: Writer | None = None,
+        demo: bool = False,
     ) -> None:
         self.ws = ws
+        self.silent_triggers = set() if demo else SILENT_TRIGGERS
         self.jev = jev
         self.writer = writer  # LLM that words the agents' arguments; None = tag meanings only
         self.log_path = log_path
@@ -195,7 +211,7 @@ class Connection:
     async def _deliberate(self, trigger: Trigger, problem_id: str) -> None:
         slices = self.session.slices()
         secrets = secret_values(slices)
-        silent = trigger in SILENT_TRIGGERS
+        silent = trigger in self.silent_triggers
         held_rounds: list[dict[str, Any]] = []
 
         local_bus = InProcBus()
@@ -211,9 +227,9 @@ class Connection:
                 if "positions" not in message:
                     continue  # the decision is sent below, with its explanation
                 if silent:
-                    held_rounds.append(round_message(message))
+                    held_rounds.append(round_message(message, trigger.value))
                 else:
-                    await self.send(round_message(message))
+                    await self.send(round_message(message, trigger.value))
 
         forwarder = asyncio.create_task(forward_rounds(subscription))
         try:
@@ -242,8 +258,8 @@ class Connection:
             await self.send(message)
 
         context = self.session.hint_context()
-        explanation, hint_result = await asyncio.gather(
-            explain_deliberation_async(decision, slices),
+        why, hint_result = await asyncio.gather(
+            explain_why_async(decision, slices, jev=self.jev),
             write_hint_async(
                 context["code"],
                 context["last_error"],
@@ -251,11 +267,14 @@ class Connection:
                 task_for(problem_id).reference_solution_summary,
                 jev=self.jev,
                 last_passed=context["last_passed"],
+                problem_statement=task_for(problem_id).statement,
             )
             if level > 0
             else _none(),
         )
         hint, hint_level = _hint(hint_result, level)
+        # The closing sentence states the level actually given, which the hint checks may have lowered.
+        explanation = frame_explanation(why, decision, slices, given_level=hint_level if hint else 0)
 
         await self.send(
             {
@@ -288,6 +307,7 @@ class Connection:
                 task.reference_solution_summary,
                 jev=self.jev,
                 last_passed=context["last_passed"],
+                problem_statement=task.statement,
             ),
             level,
         )
@@ -324,22 +344,28 @@ def create_app(
     log_path: Path = DEFAULT_LOG_PATH,
     slim: Publisher | None = None,
     writer: Writer | None = None,
+    demo: bool | None = None,
 ) -> FastAPI:
     """Build the app. Pass `jev` (e.g. FakeJevClient) to run without the TypeSafe API.
 
     In the real app, SLIM publishing starts when SLIM_ENDPOINT is set (see agntcy_slim.py)
     and agents word their arguments with hints.complete_text; tests can pass a fake `slim`
-    publisher and `writer` instead.
+    publisher and `writer` instead. `demo` (default: the SHERPA_DEMO env var) shows background
+    check-ins in the browser too.
     """
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if jev is not None:
             app.state.jev, app.state.slim, app.state.writer = jev, slim, writer
+            app.state.demo = demo_mode() if demo is None else demo
             yield
             return
         app.state.writer = writer or complete_text
         _load_env_file(str(ROOT / ".env.local"))
+        app.state.demo = demo_mode() if demo is None else demo
+        if app.state.demo:
+            log.info("Demo mode: background check-ins are shown in the browser.")
         publisher = await start_publisher_from_env()
         app.state.slim = publisher
         try:
@@ -359,7 +385,7 @@ def create_app(
     @app.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket) -> None:
         await ws.accept()
-        await Connection(ws, app.state.jev, log_path, app.state.slim, app.state.writer).run()
+        await Connection(ws, app.state.jev, log_path, app.state.slim, app.state.writer, app.state.demo).run()
 
     return app
 
