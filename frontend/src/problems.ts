@@ -14,6 +14,12 @@ export type Problem = {
   params: string[];
   starter: string;
   cases: TestCase[];
+  // Optional, for drawing recursive solutions. Expressions run inside each call of the
+  // learner's code; the first that works is used, so list common variable names.
+  traceLabel?: string[]; // what to show in each node, e.g. "sum(subset)"
+  traceLabelText?: string; // legend text for the label
+  traceGoal?: string; // may use `label`, e.g. "label == amount"; true turns the node green
+  traceGoalText?: string; // legend text for the goal
 };
 
 // Index 0 is a warm-up. Indexes 1-30 are the main set.
@@ -1131,6 +1137,14 @@ export const PROBLEMS: Problem[] = [
   },
   {
     "id": "coin-change",
+    "traceLabel": [
+      "sum(subset)", "sum(path)", "sum(curr)", "sum(cur)", "sum(current)", "sum(combo)",
+      "sum(comb)", "sum(chosen)", "sum(stack)", "sum(coins_used)",
+      "curr_sum", "cur_sum", "current_sum", "total", "amount - remaining", "amount - rem"
+    ],
+    "traceLabelText": "sum of the coins chosen so far",
+    "traceGoal": "label == amount",
+    "traceGoalText": "sum == amount",
     "title": "Coin Change",
     "difficulty": "Medium",
     "description": "Given coin denominations and a target amount, return the fewest coins needed to make that amount, or -1 if it is impossible. You have unlimited coins of each kind.",

@@ -11,14 +11,17 @@ Per Section 10 of the Spotter design doc:
 - The LLM never decides whether to intervene; it only executes after the multi-agent
   deliberation finishes.
 
-Powered by Google Gemini (google-genai SDK), with deterministic offline fallback
-templates for testing and hackathon demo reliability.
+Providers, tried in order: Nemotron (any OpenAI-compatible endpoint, e.g. NVIDIA's hosted
+API or vLLM on a Brev GPU; enabled by NEMOTRON_BASE_URL + NEMOTRON_MODEL), then Google
+Gemini (google-genai SDK), then deterministic offline templates for testing and demo
+reliability.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -71,6 +74,61 @@ def _get_api_key(explicit_key: str | None = None) -> str | None:
     if explicit_key is not None:
         return explicit_key.strip() or None
     return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+
+
+# ---------------------------------------------------------------------------
+# Nemotron (OpenAI-compatible chat completions)
+# ---------------------------------------------------------------------------
+
+NEMOTRON_TIMEOUT_SECONDS = 20.0
+NEMOTRON_MAX_TOKENS = 400
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def nemotron_enabled() -> bool:
+    return bool(os.getenv("NEMOTRON_BASE_URL") and os.getenv("NEMOTRON_MODEL"))
+
+
+async def _nemotron_complete(prompt: str, transport: Any = None) -> str | None:
+    """One chat completion from the configured Nemotron endpoint, or None on any failure.
+
+    Env: NEMOTRON_BASE_URL (ending in /v1), NEMOTRON_MODEL, optional NEMOTRON_API_KEY,
+    optional NEMOTRON_SYSTEM (e.g. "/no_think" for models that switch reasoning by system
+    prompt), optional NEMOTRON_ENABLE_THINKING ("true" to allow reasoning; off by default,
+    since hints should be short and fast). Reasoning text is never shown: only `content`
+    is read, and any <think>...</think> block in it is stripped.
+    """
+    if not nemotron_enabled():
+        return None
+    import httpx
+
+    base = os.environ["NEMOTRON_BASE_URL"].rstrip("/")
+    headers = {"Content-Type": "application/json"}
+    if os.getenv("NEMOTRON_API_KEY"):
+        headers["Authorization"] = f"Bearer {os.environ['NEMOTRON_API_KEY']}"
+    messages = [{"role": "user", "content": prompt}]
+    if os.getenv("NEMOTRON_SYSTEM"):
+        messages.insert(0, {"role": "system", "content": os.environ["NEMOTRON_SYSTEM"]})
+    body = {
+        "model": os.environ["NEMOTRON_MODEL"],
+        "messages": messages,
+        "max_tokens": NEMOTRON_MAX_TOKENS,
+        "temperature": 0.3,
+        "chat_template_kwargs": {"enable_thinking": os.getenv("NEMOTRON_ENABLE_THINKING", "").lower() == "true"},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=NEMOTRON_TIMEOUT_SECONDS, transport=transport) as client:
+            response = await client.post(f"{base}/chat/completions", json=body, headers=headers)
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"].get("content") or ""
+    except Exception as err:
+        logger.warning("Nemotron request failed (%s: %s); trying the next provider.", type(err).__name__, err)
+        return None
+    text = _THINK_BLOCK.sub("", content).strip()
+    if not text:
+        logger.warning("Nemotron returned no text; trying the next provider.")
+        return None
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -262,9 +320,14 @@ async def _generate_raw_hint(
     api_key: str | None,
     model: str,
 ) -> tuple[str, bool]:
-    """Generate raw hint text. Returns (text, from_gemini)."""
+    """Generate raw hint text. Returns (text, from_llm)."""
     if help_level == HelpLevel.NONE:
         return "", False
+
+    prompt = _build_hint_prompt(code, error, help_level, reference_solution_summary)
+    nemotron_text = await _nemotron_complete(prompt)
+    if nemotron_text:
+        return nemotron_text, True
 
     key = _get_api_key(api_key)
     if not key:
@@ -275,7 +338,6 @@ async def _generate_raw_hint(
         from google import genai
 
         client = genai.Client(api_key=key)
-        prompt = _build_hint_prompt(code, error, help_level, reference_solution_summary)
         response = await client.aio.models.generate_content(
             model=model,
             contents=prompt,
@@ -383,7 +445,12 @@ async def explain_deliberation_async(
     api_key: str | None = None,
     model: str = DEFAULT_GEMINI_MODEL,
 ) -> str:
-    """Generate an explanation of the multi-agent deliberation using Gemini API (async)."""
+    """Explain the deliberation in plain language: Nemotron, then Gemini, then a template."""
+    prompt = _build_explainer_prompt(decision, slices)
+    nemotron_text = await _nemotron_complete(prompt)
+    if nemotron_text:
+        return nemotron_text
+
     key = _get_api_key(api_key)
     if not key:
         logger.warning("Falling back to template explanation: GEMINI_API_KEY is not set.")
@@ -393,7 +460,6 @@ async def explain_deliberation_async(
         from google import genai
 
         client = genai.Client(api_key=key)
-        prompt = _build_explainer_prompt(decision, slices)
         response = await client.aio.models.generate_content(
             model=model,
             contents=prompt,

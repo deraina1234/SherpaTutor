@@ -243,10 +243,18 @@ export default function AgentPanel({
   d,
   onAskMore,
   onChat,
+  traceCase,
+  tracing,
+  traceError,
+  onTrace,
 }: {
   d: Deliberation;
   onAskMore: () => void;
   onChat: (text: string) => void;
+  traceCase: number | null; // failing case the learner can trace, or null when not offered
+  tracing: boolean;
+  traceError: string | null;
+  onTrace: () => void;
 }) {
   // Remember which decision the learner already asked about, so the button only fires once per decision
   const [askedFor, setAskedFor] = useState<DecisionMsg | null>(null);
@@ -338,6 +346,12 @@ export default function AgentPanel({
             HINT · LEVEL {d.hint.level}
           </div>
           <div style={{ fontSize: 14, lineHeight: 1.45 }}>{d.hint.text}</div>
+          {traceCase !== null && (
+            <button onClick={onTrace} disabled={tracing} style={{ marginTop: 8 }}>
+              {tracing ? "Tracing…" : `See what your code does on Case ${traceCase + 1}`}
+            </button>
+          )}
+          {traceError && <div style={{ fontSize: 12, color: "#f87171", marginTop: 6 }}>{traceError}</div>}
         </div>
       )}
 

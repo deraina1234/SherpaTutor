@@ -4,9 +4,9 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def no_live_llm_keys(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Tests never call Gemini: hints.py loads .env.local on import, so unset its keys.
+    """Tests never call Gemini or Nemotron: hints.py loads .env.local on import, so unset their keys.
 
     Tests that need a key pass one explicitly (and mock the client).
     """
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "NEMOTRON_BASE_URL", "NEMOTRON_MODEL", "NEMOTRON_API_KEY", "NEMOTRON_SYSTEM", "NEMOTRON_ENABLE_THINKING"):
+        monkeypatch.delenv(key, raising=False)

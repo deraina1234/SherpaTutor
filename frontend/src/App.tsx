@@ -3,8 +3,18 @@ import Editor from "@monaco-editor/react";
 import { PROBLEMS, type Problem } from "./problems";
 import { Socket, type InMsg } from "./socket";
 import AgentPanel from "./AgentPanel";
-import { applyMessage, emptyDeliberation, type Deliberation } from "./deliberation";
+import { applyMessage, emptyDeliberation, type Deliberation, type HintMsg } from "./deliberation";
 import { useRevealQueue } from "./useRevealQueue";
+import TraceViewer, { type TraceResult } from "./TraceViewer";
+
+// Hints at this level or above offer a step-by-step trace of the learner's own code.
+const TRACE_MIN_LEVEL = 2;
+
+// One case to trace, with the exact code that was run.
+type TraceTarget = { problemId: string; code: string; caseIndex: number };
+
+// What the last run left traceable: its failing cases, or every case if it timed out.
+type LastRun = { problemId: string; code: string; failing: number[]; timedOut: boolean };
 
 type CaseResult = { ok: boolean; actual: string | null; error: string | null };
 type RunState = {
@@ -51,6 +61,11 @@ export default function App() {
   const [run, setRun] = useState<RunState | null>(null);
   const [selected, setSelected] = useState(0);
   const [delib, setDelib] = useState<Deliberation>(emptyDeliberation);
+  const [lastRun, setLastRun] = useState<LastRun | null>(null);
+  const [hintAtLastRun, setHintAtLastRun] = useState<HintMsg | null>(null);
+  const [tracing, setTracing] = useState(false);
+  const [traceError, setTraceError] = useState<string | null>(null);
+  const [openTrace, setOpenTrace] = useState<{ target: TraceTarget; result: TraceResult } | null>(null);
 
   const problem = PROBLEMS[problemIndex];
   const applyMsg = useCallback((m: InMsg) => setDelib((prev) => applyMessage(prev, m)), []);
@@ -58,6 +73,9 @@ export default function App() {
 
   const workerRef = useRef<Worker | null>(null);
   const timerRef = useRef<number | undefined>(undefined);
+  const traceTimerRef = useRef<number | undefined>(undefined);
+  const runCodeRef = useRef("");
+  const pendingTraceRef = useRef<TraceTarget | null>(null);
   const socketRef = useRef<Socket | null>(null);
 
   // Per-problem code and last-sent snapshot, so switching problems keeps your work
@@ -94,6 +112,14 @@ export default function App() {
         setReady(true);
         return;
       }
+      if (e.data.kind === "trace") {
+        window.clearTimeout(traceTimerRef.current);
+        setTracing(false);
+        const target = pendingTraceRef.current;
+        if (e.data.ok && target) setOpenTrace({ target, result: e.data.trace });
+        else setTraceError(e.data.ok ? null : "Couldn't trace your code.");
+        return;
+      }
       window.clearTimeout(timerRef.current);
       setRunning(false);
       const r: RunState = e.data.ok
@@ -106,6 +132,11 @@ export default function App() {
         : { timedOut: false, compileError: e.data.error, cases: [], stdout: "" };
       setRun(r);
       sendRunEvent(r);
+      // Cases that ran and gave a wrong answer or raised can be traced; a compile error has nothing to step through.
+      const failing = r.compileError ? [] : r.cases.flatMap((c, i) => (c.ok ? [] : [i]));
+      setLastRun({ problemId: problemRef.current.id, code: runCodeRef.current, failing, timedOut: false });
+      // Show the first failing case, so its details and trace button are what the learner sees.
+      if (failing.length > 0) setSelected(failing[0]);
     };
     workerRef.current = w;
   }, [sendRunEvent]);
@@ -152,6 +183,8 @@ export default function App() {
 
   function switchProblem(i: number) {
     clearQueue();
+    setLastRun(null);
+    setTraceError(null);
     setProblemIndex(i);
     setRun(null);
     setSelected(0);
@@ -160,11 +193,16 @@ export default function App() {
   }
 
   function runTests() {
-    if (!ready || running) return;
+    if (!ready || running || tracing) return;
     setRunning(true);
+    // A new run hides the trace offer until the next qualifying hint.
+    runCodeRef.current = currentCode(problem);
+    setLastRun(null);
+    setTraceError(null);
+    setHintAtLastRun(delib.hint);
     workerRef.current?.postMessage({
       id: Date.now(),
-      code: currentCode(problem),
+      code: runCodeRef.current,
       fnName: problem.fnName,
       cases: problem.cases,
     });
@@ -176,8 +214,49 @@ export default function App() {
       const r: RunState = { timedOut: true, compileError: null, cases: [], stdout: "" };
       setRun(r);
       sendRunEvent(r);
+      // Which case hung is unknown, so any case can be traced; the step limit shows the runaway work.
+      setLastRun({ problemId: problemRef.current.id, code: runCodeRef.current, failing: [], timedOut: true });
     }, 5000);
   }
+
+  // Any case can be traced at any time: it runs the learner's own current code, so it can't leak a solution.
+  function startTrace(caseIndex: number) {
+    if (!ready || running || tracing) return;
+    const traceTarget: TraceTarget = { problemId: problem.id, code: currentCode(problem), caseIndex };
+    const c = problem.cases[caseIndex];
+    setTracing(true);
+    setTraceError(null);
+    pendingTraceRef.current = traceTarget;
+    workerRef.current?.postMessage({
+      type: "trace",
+      id: Date.now(),
+      code: traceTarget.code,
+      fnName: problem.fnName,
+      args: c.args,
+      expected: c.expected,
+      spec: { label: problem.traceLabel ?? [], goal: problem.traceGoal ?? null },
+    });
+    // Same safety net as runs: kill and restart Python if tracing hangs
+    traceTimerRef.current = window.setTimeout(() => {
+      setReady(false);
+      createWorker();
+      setTracing(false);
+      setTraceError("Tracing timed out after 5 seconds.");
+    }, 5000);
+  }
+
+  const closeTrace = useCallback(() => setOpenTrace(null), []);
+
+  // The agents also suggest a trace in the hint card when they decide on a level 2+ hint.
+  const suggestedCase = lastRun?.failing[0] ?? (lastRun?.timedOut ? 0 : null);
+  const traceCase =
+    suggestedCase !== null &&
+    lastRun?.problemId === problem.id &&
+    delib.hint !== null &&
+    delib.hint !== hintAtLastRun &&
+    delib.hint.level >= TRACE_MIN_LEVEL
+      ? suggestedCase
+      : null;
 
   const verdict = run ? verdictOf(run) : null;
   const passedCount = run ? run.cases.filter((c) => c.ok).length : 0;
@@ -209,7 +288,7 @@ export default function App() {
             </option>
           ))}
         </select>
-        <button onClick={runTests} disabled={!ready || running}>
+        <button onClick={runTests} disabled={!ready || running || tracing}>
           {!ready ? "Loading Python..." : running ? "Running..." : "Run"}
         </button>
         <span
@@ -328,7 +407,16 @@ export default function App() {
                   </button>
                 );
               })}
+              <button
+                onClick={() => startTrace(selected)}
+                disabled={!ready || running || tracing}
+                title="Watch your code run line by line on the selected case"
+                style={{ marginLeft: "auto" }}
+              >
+                {tracing ? "Tracing…" : `▶ Step through Case ${selected + 1}`}
+              </button>
             </div>
+            {traceError && <div style={{ fontSize: 12, color: "#f87171", marginBottom: 8 }}>{traceError}</div>}
 
             <div style={{ display: "grid", gap: 8 }}>
               <div>
@@ -360,13 +448,27 @@ export default function App() {
         </div>
 
         <AgentPanel
-  d={delib}
-  onAskMore={() => socketRef.current?.send({ type: "ask_nudge", ts: Date.now(), problem_id: problem.id })}
-  onChat={(text) =>
-    socketRef.current?.send({ type: "chat", ts: Date.now(), problem_id: problem.id, text })
-  }
-/>
+          d={delib}
+          onAskMore={() => socketRef.current?.send({ type: "ask_nudge", ts: Date.now(), problem_id: problem.id })}
+          onChat={(text) =>
+            socketRef.current?.send({ type: "chat", ts: Date.now(), problem_id: problem.id, text })
+          }
+          traceCase={traceCase}
+          tracing={tracing}
+          traceError={traceError}
+          onTrace={() => traceCase !== null && startTrace(traceCase)}
+        />
       </div>
+
+      {openTrace && openTrace.target.problemId === problem.id && (
+        <TraceViewer
+          problem={problem}
+          caseIndex={openTrace.target.caseIndex}
+          code={openTrace.target.code}
+          result={openTrace.result}
+          onClose={closeTrace}
+        />
+      )}
     </div>
   );
 }
