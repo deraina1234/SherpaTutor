@@ -9,7 +9,7 @@ Spotter design doc:
     * Soft disagreement (spread 1): Act at the lower level (least intrusive action).
     * Deadlock (spread >= 2): Withhold automatic hint; ask learner ("Want a nudge?").
     * Integrity cap: Clamp any level above Integrity's cap; set cap_applied = True.
-    * Unanimous hold: Stop early if no agent changes position in a round.
+    * Unanimous hold: Stop early if no agent changes its level in a round.
 """
 
 from __future__ import annotations
@@ -224,8 +224,8 @@ async def run_deliberation(
         if round_outcome == OutcomeKind.CONSENSUS:
             break
 
-        # 2. Unanimous hold: every agent kept its previous Position
-        if all(curr == prev for curr, prev in zip(revised_positions, current_positions)):
+        # 2. Unanimous hold: every agent kept its level (holding may still add rebuttals)
+        if all(curr.level == prev.level for curr, prev in zip(revised_positions, current_positions)):
             break
 
         current_positions = revised_positions

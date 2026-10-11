@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from contracts import HelpLevel, HintRecord, IntegritySlice, LearningSlice, MomentumSlice
+from contracts import HelpLevel, HintRecord, IntegritySlice, LastRun, LearningSlice, MomentumSlice
 from redaction import strip_secret_fields
 
 # ---------------------------------------------------------------------------
@@ -341,6 +341,8 @@ class StateBuilder:
             self._on_edit(str(event.get("snapshot", "")), t)
             return None  # edits never trigger directly (no per-keystroke deliberation)
         if kind == "run":
+            if isinstance(event.get("snapshot"), str):
+                self._on_edit(event["snapshot"], t)  # the code that ran, which may not have arrived as an edit yet
             failed = self._on_run(bool(event.get("passed")), event.get("first_error"), t, event)
             return self._fire(Trigger.FAILED_RUN, t) if failed else None
         if kind == "chat":
@@ -406,10 +408,13 @@ class StateBuilder:
             {"level": h.level, "seconds_ago": int(t - h.at)} for h in self.hints
         ]
         return {
+            "task_id": self.task.task_id,
             "learner_level": self.learner_level,
             "hint_history": history,
             "seconds_on_task": int(t - self.start) if self.start is not None else 0,
             "recent_progress": self.recent_progress(t),
+            "code": self.code_excerpt(),
+            "last_run": self.last_run(),
         }
 
     def momentum_slice(self, now: float | None = None) -> MomentumSlice:
@@ -424,6 +429,7 @@ class StateBuilder:
             "failed_runs_since_progress": self.failed_runs_since_progress,
             "same_function_rewrites": max(self.rewrites.values(), default=0),
             "learner_message": msg,
+            "last_run": self.last_run(),
         }
 
     def integrity_slice(self) -> IntegritySlice:
@@ -441,6 +447,17 @@ class StateBuilder:
             "last_error": self.last_error,
             "last_passed": self.last_passed,
         }
+
+    def last_run(self) -> LastRun:
+        return {"passed": self.last_passed, "error": self.last_error}
+
+    def solved(self) -> bool:
+        """The last run passed every case and the code has not been edited since."""
+        return (
+            self.last_passed is True
+            and self.last_run_at is not None
+            and (self.last_edit_at is None or self.last_edit_at <= self.last_run_at)
+        )
 
     def code_excerpt(self, max_lines: int = CODE_EXCERPT_LINES) -> str:
         lines = self.code.splitlines()
@@ -662,6 +679,10 @@ class Session:
 
     def hint_context(self, max_lines: int = CODE_EXCERPT_LINES) -> dict[str, Any]:
         return self._require().hint_context(max_lines)
+
+    def solved(self) -> bool:
+        b = self.active
+        return b is not None and b.solved()
 
     def snapshot(self, now: float | None = None) -> dict[str, Any]:
         return self._require().snapshot(now)

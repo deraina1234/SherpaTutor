@@ -192,11 +192,19 @@ class HintRecord(TypedDict):
     seconds_ago: int
 
 
+class LastRun(TypedDict):
+    passed: bool | None  # None = not run yet
+    error: str | None  # first failing case or exception, None when passed or not run
+
+
 class LearningSlice(TypedDict, total=False):
+    task_id: str
     learner_level: str
     hint_history: list[HintRecord]
     seconds_on_task: int
     recent_progress: bool
+    code: str  # excerpt around the last edit
+    last_run: LastRun
 
 
 class MomentumSlice(TypedDict, total=False):
@@ -205,6 +213,7 @@ class MomentumSlice(TypedDict, total=False):
     failed_runs_since_progress: int
     same_function_rewrites: int
     learner_message: str | None
+    last_run: LastRun
 
 
 class IntegritySlice(TypedDict, total=False):
@@ -238,8 +247,8 @@ class Agent(Protocol):
         """Return the agent's Position for `round` after seeing its peers' positions.
 
         Must move at most MAX_LEVEL_STEP_PER_ROUND levels from the agent's previous
-        position. If the agent decides to hold, it must return that previous
-        position unchanged.
+        position. An agent that holds keeps its level; it may return the previous
+        position unchanged, or a new one at the same level that adds rebuttals.
         """
         ...
 

@@ -95,12 +95,19 @@ export default function App() {
 
   const sendRunEvent = useCallback((r: RunState) => {
     const p = problemRef.current;
+    // Send the code that ran with the result: edits otherwise reach the backend up to 5s later.
+    const snapshot = runCodeRef.current;
+    snapshotsRef.current[p.id] = snapshot;
+    const passed = verdictOf(r) === "Accepted";
+    // A hint about a bug that is now fixed would read as a claim that the passing code is wrong.
+    if (passed) setDelib((prev) => ({ ...prev, hint: null }));
     socketRef.current?.send({
       type: "run",
       ts: Date.now(),
       problem_id: p.id,
-      passed: verdictOf(r) === "Accepted",
+      passed,
       first_error: firstErrorOf(r, p),
+      snapshot,
     });
   }, []);
 

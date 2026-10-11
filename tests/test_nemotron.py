@@ -69,3 +69,18 @@ def test_hint_prefers_nemotron_then_falls_back_to_template(nemotron_env, monkeyp
     # No Gemini key in tests, so the template is next.
     template = asyncio.run(write_hint_async(CODE, "Case 2: expected 4, got 5", 2)).text
     assert template and template != "Nemotron hint"
+
+
+def test_retries_once_on_a_transient_failure(nemotron_env) -> None:
+    statuses = iter([503, 200])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(next(statuses), json={"choices": [{"message": {"content": "Second try."}}]})
+
+    assert asyncio.run(_nemotron_complete("p", transport=httpx.MockTransport(handler))) == "Second try."
+
+
+def test_does_not_retry_a_client_error(nemotron_env) -> None:
+    transport, requests = completion("x", 401)
+    assert asyncio.run(_nemotron_complete("p", transport=transport)) is None
+    assert len(requests) == 1

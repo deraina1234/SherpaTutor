@@ -28,7 +28,7 @@ from agents import IntegrityAgent, LearningAgent, MomentumAgent
 from agntcy_slim import FanoutBus, Publisher, start_publisher_from_env
 from contracts import HelpLevel, JevClient
 from deliberation import InProcBus, run_deliberation
-from hints import explain_deliberation_async, write_hint_async
+from hints import ALL_TESTS_PASS_TEXT, explain_deliberation_async, write_hint_async
 from jev import TypeSafeJevClient, _load_env_file
 from logger import log_deliberation
 from redaction import redact, secret_values
@@ -58,6 +58,18 @@ def to_proposal(position: dict[str, Any]) -> dict[str, Any]:
     }
     if position.get("cap") is not None:
         proposal["cap"] = position["cap"]
+    responses = [
+        {
+            "to": str(argument["evidence"]["responds_to"]).split(".", 1)[0],
+            "claim": argument["claim"],
+            "accepted": argument.get("attacks") is None,
+            "holds": argument["evidence"].get("holds"),
+        }
+        for argument in position.get("arguments", [])
+        if "responds_to" in argument.get("evidence", {})
+    ]
+    if responses:
+        proposal["responses"] = responses
     return proposal
 
 
@@ -153,6 +165,12 @@ class Connection:
                 return  # learner switched problems while this waited
             if trigger is not Trigger.ASK_NUDGE and seq < self._latest_deliberation:
                 return  # a newer trigger is queued; it will deliberate on fresher state
+            if self.session.solved() and trigger is not Trigger.LEARNER_MESSAGE:
+                # Every test passes and nothing changed since: no hint to give. A nudge request
+                # gets a plain "all tests pass" instead of a hint about a bug that is not there.
+                if trigger is Trigger.ASK_NUDGE:
+                    await self.send({"type": "hint", "level": 0, "text": ALL_TESTS_PASS_TEXT})
+                return
             try:
                 if trigger is Trigger.ASK_NUDGE:
                     await self._nudge(problem_id)
@@ -214,7 +232,12 @@ class Connection:
         explanation, hint_result = await asyncio.gather(
             explain_deliberation_async(decision, slices),
             write_hint_async(
-                context["code"], context["last_error"], level, task_for(problem_id).reference_solution_summary, jev=self.jev
+                context["code"],
+                context["last_error"],
+                level,
+                task_for(problem_id).reference_solution_summary,
+                jev=self.jev,
+                last_passed=context["last_passed"],
             )
             if level > 0
             else _none(),
@@ -246,7 +269,12 @@ class Connection:
         context = self.session.hint_context()
         hint, hint_level = _hint(
             await write_hint_async(
-                context["code"], context["last_error"], level, task.reference_solution_summary, jev=self.jev
+                context["code"],
+                context["last_error"],
+                level,
+                task.reference_solution_summary,
+                jev=self.jev,
+                last_passed=context["last_passed"],
             ),
             level,
         )

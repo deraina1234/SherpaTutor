@@ -293,3 +293,28 @@ def test_snapshot_has_no_reference_solution() -> None:
     # Deliberation still gets it
     assert _active(s).integrity_slice().get("reference_solution_summary") == summary
 
+
+
+def test_solved_until_the_code_changes_and_slices_show_the_run() -> None:
+    b = builder()
+    b.ingest(edit(0, STARTER))
+    assert not b.solved()
+    b.ingest(run(10, passed=False, error="Case 2: expected 4, got 5"))
+    assert not b.solved()
+    assert b.learning_slice()["last_run"] == {"passed": False, "error": "Case 2: expected 4, got 5"}
+    assert b.learning_slice()["code"] == STARTER
+    b.ingest(run(20, passed=True))
+    assert b.solved()
+    assert b.momentum_slice()["last_run"] == {"passed": True, "error": None}
+    b.ingest(edit(30, STARTER + "\n# tweak\n"))
+    assert not b.solved()
+
+
+def test_run_snapshot_counts_as_the_edit_that_ran() -> None:
+    b = builder()
+    b.ingest(edit(0, STARTER))
+    fixed = STARTER.replace("pass", "return sorted(set(nums))[-2]")
+    b.ingest({**run(10, passed=True), "snapshot": fixed})
+    assert b.code == fixed and b.solved()
+    b.ingest(edit(14, fixed))  # the 5s edit timer resends the same code: still solved
+    assert b.solved()

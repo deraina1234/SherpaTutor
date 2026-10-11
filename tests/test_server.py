@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from jev import FakeJevClient
-from hints import HintResult
+from hints import ALL_TESTS_PASS_TEXT, HintResult
 from server import _hint, create_app, nudge_level, round_message, to_proposal
 from state_builder import task_for
 
@@ -135,3 +135,23 @@ def test_server_runs_jev_leak_check_on_hints(tmp_path) -> None:
         assert ws.receive_json()["type"] == "hint"
     leak_checks = [state for kind, state, _ in jev.calls if kind == "noul" and "hint" in state]
     assert leak_checks and leak_checks[0]["reference_solution_summary"] == SECRET
+
+
+def test_to_proposal_lists_responses_to_peer_arguments() -> None:
+    rebuttal = {
+        "id": "learning.r1.re.momentum.r0.long_idle", "agent": "learning", "round": 1, "claim": "long_idle",
+        "direction": 0, "evidence": {"responds_to": "momentum.r0.long_idle", "holds": 0.2}, "attacks": "momentum.r0.long_idle",
+    }
+    position = {"agent": "learning", "level": 0, "confidence": 0.5, "reason_tags": [], "cap": None, "arguments": [rebuttal]}
+    assert to_proposal(position)["responses"] == [{"to": "momentum", "claim": "long_idle", "accepted": False, "holds": 0.2}]
+
+
+def test_nudge_on_solved_code_says_tests_pass_instead_of_hinting(tmp_path) -> None:
+    jev = FakeJevClient(score_value=1, noul_probability=0.1)
+    with TestClient(create_app(jev=jev, log_path=tmp_path / "sessions.jsonl")) as c, c.websocket_connect("/ws") as ws:
+        ws.send_json(event("problem", seconds_ago=60))
+        ws.send_json(event("edit", seconds_ago=30, snapshot=CODE, diff_summary={"added": 2, "deleted": 1}))
+        ws.send_json(event("run", seconds_ago=10, passed=True, first_error=None))
+        ws.send_json(event("ask_nudge"))
+        assert ws.receive_json() == {"type": "hint", "level": 0, "text": ALL_TESTS_PASS_TEXT}
+    assert jev.calls == []  # no deliberation, no leak check

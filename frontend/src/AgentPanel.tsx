@@ -8,13 +8,13 @@ const AGENTS = [
     name: "Learning",
     color: "#60a5fa",
     objective: "Protect productive struggle and long-term learning.",
-    sees: "Learner level, hint history, time on task",
+    sees: "Your code, last run result, learner level, hint history, time on task",
   },
   {
     name: "Momentum",
     color: "#f472b6",
     objective: "Minimize time stuck and frustration.",
-    sees: "Edit and idle timing, repeated errors, failed runs, learner messages",
+    sees: "Last run result, edit and idle timing, repeated errors, failed runs, learner messages",
   },
   {
     name: "Integrity",
@@ -225,6 +225,17 @@ function AgentCard({
               ))}
             </div>
           )}
+          {latest.responses && latest.responses.length > 0 && (
+            <div style={{ display: "grid", gap: 2, fontSize: 12, lineHeight: 1.4 }}>
+              {latest.responses.map((r) => (
+                <div key={`${r.to}.${r.claim}`} style={{ color: r.accepted ? "#4ade80" : "#f87171" }}>
+                  {r.accepted ? "Agreed with" : "Rejected"} {r.to.replace(/^./, (c) => c.toUpperCase())}: "
+                  {tagLabel(r.claim)}"
+                  {r.holds !== null && <span style={{ color: "#777" }}> ({Math.round(r.holds * 100)}% holds)</span>}
+                </div>
+              ))}
+            </div>
+          )}
           {!isIntegrity && <History entries={entries} color={meta.color} />}
         </>
       ) : (
@@ -343,7 +354,7 @@ export default function AgentPanel({
       {d.hint && (
         <div style={{ borderRadius: 8, padding: 10, background: "#1f2d24", border: "1px solid #2f4a39" }}>
           <div style={{ fontSize: 11, color: "#4ade80", marginBottom: 4 }}>
-            HINT · LEVEL {d.hint.level}
+            {d.hint.level === 0 ? "ALL TESTS PASS" : `HINT · LEVEL ${d.hint.level}`}
           </div>
           <div style={{ fontSize: 14, lineHeight: 1.45 }}>{d.hint.text}</div>
           {traceCase !== null && (

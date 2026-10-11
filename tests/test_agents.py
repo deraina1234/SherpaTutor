@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from agents import IntegrityAgent, LearningAgent, MomentumAgent
-from contracts import Position
+from contracts import Argument, Position, argument_id
 from jev import FakeJevClient
 
 LEARNING_SLICE = {
@@ -67,56 +67,84 @@ def test_revise_hold_returns_same_position() -> None:
     assert revised is first
 
 
-@pytest.mark.parametrize(("selected", "expected"), [("raise", 2), ("lower", 0)])
-def test_revise_moves_one_step(selected: str, expected: int) -> None:
-    jev = FakeJevClient(score_value=1, choice_selected=selected)
-    agent = LearningAgent(jev)
+def argued(agent: str, level: int, claim: str, direction: int) -> Position:
+    argument = Argument(
+        id=argument_id(agent, 0, claim), agent=agent, round=0, claim=claim, direction=direction, evidence={"n": 3}
+    )
+    return Position(agent=agent, round=0, level=level, confidence=0.8, reason_tags=[claim], arguments=[argument])
+
+
+@pytest.mark.parametrize(
+    ("score", "peer_level", "claim", "direction", "expected"),
+    [(1, 3, "repeated_error", 1, 2), (2, 0, "active_progress", -1, 1)],
+)
+def test_revise_moves_one_step_toward_peer_when_its_argument_holds(
+    score: int, peer_level: int, claim: str, direction: int, expected: int
+) -> None:
+    agent = LearningAgent(FakeJevClient(score_value=score, noul_probability=0.9))
 
     async def run() -> Position:
         await agent.propose(LEARNING_SLICE)
-        return await agent.revise(LEARNING_SLICE, [peer("momentum", 3, ["repeated_error"])], 1)
+        return await agent.revise(LEARNING_SLICE, [argued("momentum", peer_level, claim, direction)], 1)
 
     revised = asyncio.run(run())
-    assert (revised.level, revised.round) == (expected, 1)
+    assert (revised.level, revised.round, revised.confidence) == (expected, 1, 0.9)
+    response = revised.arguments[-1]
+    assert response.evidence == {"responds_to": f"momentum.r0.{claim}", "holds": 0.9}
+    assert response.attacks is None and response.direction == direction
 
 
-def test_revise_sends_peers_but_not_self_to_jev() -> None:
-    jev = FakeJevClient(score_value=1, choice_selected="raise")
+def test_revise_rebuts_a_weak_argument_and_keeps_its_level() -> None:
+    agent = LearningAgent(FakeJevClient(score_value=1, noul_probability=0.1))
+
+    async def run() -> Position:
+        await agent.propose(LEARNING_SLICE)
+        return await agent.revise(LEARNING_SLICE, [argued("momentum", 3, "long_idle", 1)], 1)
+
+    revised = asyncio.run(run())
+    assert (revised.level, revised.round) == (1, 1)
+    rebuttal = revised.arguments[-1]
+    assert (rebuttal.attacks, rebuttal.direction) == ("momentum.r0.long_idle", 0)
+
+
+def test_revise_judges_peer_arguments_once_against_own_observations() -> None:
+    jev = FakeJevClient(score_value=1, noul_probability=0.5)
     agent = LearningAgent(jev)
+    momentum = argued("momentum", 3, "repeated_error", 1)
 
-    async def run() -> None:
+    async def run() -> tuple[Position, Position, Position]:
         mine = await agent.propose(LEARNING_SLICE)
-        await agent.revise(LEARNING_SLICE, [mine, peer("momentum", 3, ["repeated_error"])], 1)
+        first = await agent.revise(LEARNING_SLICE, [mine, momentum], 1)
+        return mine, first, await agent.revise(LEARNING_SLICE, [mine, momentum], 2)
 
-    asyncio.run(run())
-    kind, state, _ = jev.calls[-1]
-    assert kind == "choice"
-    assert [p["agent"] for p in state["peer_positions"]] == ["momentum"]
-    assert state["my_position"]["level"] == 1
+    mine, first, second = asyncio.run(run())
+    assert first is mine and second is mine  # undecided: neither moves nor rebuts
+    judged = [state for kind, state, _ in jev.calls if kind == "noul" and "peer_argument" in state]
+    assert len(judged) == 1
+    assert judged[0]["peer_argument"]["agent"] == "momentum"
+    assert judged[0]["peer_argument"]["wants"] == "more help"
+    assert judged[0]["my_vote"]["level"] == 1
+    assert judged[0]["observations"] == LEARNING_SLICE
 
 
-def test_revise_holds_when_margin_over_hold_is_too_small() -> None:
-    agent = LearningAgent(FakeJevClient(score_value=1, choice_probabilities={"lower": 0.19, "hold": 0.40, "raise": 0.41}))
+def test_revise_ignores_arguments_that_do_not_pull_toward_the_peer() -> None:
+    jev = FakeJevClient(score_value=1, noul_probability=0.9)
+    agent = LearningAgent(jev)
 
     async def run() -> tuple[Position, Position]:
         first = await agent.propose(LEARNING_SLICE)
-        return first, await agent.revise(LEARNING_SLICE, [], 1)
+        return first, await agent.revise(LEARNING_SLICE, [argued("momentum", 3, "active_progress", -1)], 1)
 
     first, revised = asyncio.run(run())
     assert revised is first
 
 
-def test_revise_moves_on_clear_margin_despite_low_choice_confidence() -> None:
-    # Real Jev returned this for a stuck learner: "raise" wins, but Choice confidence is only 0.13.
-    jev = FakeJevClient(score_value=1, confidence=0.13, choice_probabilities={"lower": 0.15, "hold": 0.38, "raise": 0.47})
-    agent = LearningAgent(jev)
-
-    async def run() -> Position:
-        await agent.propose(LEARNING_SLICE)
-        return await agent.revise(LEARNING_SLICE, [peer("momentum", 3, ["repeated_error"])], 1)
-
-    revised = asyncio.run(run())
-    assert (revised.level, revised.round, revised.confidence) == (2, 1, 0.47)
+def test_propose_attaches_evidence_backed_arguments() -> None:
+    position = asyncio.run(MomentumAgent(FakeJevClient(score_value=2, noul_probability=0.9)).propose(MOMENTUM_SLICE))
+    by_claim = {a.claim: a for a in position.arguments}
+    assert by_claim["long_idle"].evidence["seconds_since_last_edit"] == 240
+    assert by_claim["repeated_error"].direction == 1
+    assert by_claim["learner_requested_help"].evidence["p_asked"] == 0.9
 
 
 def test_voting_agents_never_score_or_raise_into_near_solution() -> None:

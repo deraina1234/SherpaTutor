@@ -13,6 +13,7 @@ export type OutMsg =
       problem_id: string;
       passed: boolean;
       first_error: string | null;
+      snapshot?: string; // the code that ran
     }
   | { type: "chat"; ts: number; problem_id: string; text: string }
   | { type: "ask_nudge"; ts: number; problem_id: string };
@@ -23,6 +24,14 @@ export type Proposal = {
   confidence: number;
   tags: string[];
   cap?: number; // Integrity's hard cap, if the backend sends it separately
+  responses?: Response[]; // this agent's verdicts on peers' arguments
+};
+
+export type Response = {
+  to: string; // peer agent name, lowercase
+  claim: string; // the reason tag the peer argued
+  accepted: boolean;
+  holds: number | null; // Jev's probability that the peer's argument holds
 };
 
 export type InMsg =
