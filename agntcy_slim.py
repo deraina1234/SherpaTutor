@@ -118,6 +118,7 @@ class SlimPublisher:
     _session: Any = None
     _pending: set[str] = field(default_factory=set)
     _last_invite_attempt: float = 0.0
+    _inviting: asyncio.Task[None] | None = None  # background re-invite, so publish never waits on it
 
     async def start(self) -> None:
         import slim_bindings
@@ -160,14 +161,22 @@ class SlimPublisher:
     async def publish(self, envelope: dict[str, Any]) -> None:
         if self._session is None:
             return
-        if self._pending and time.monotonic() - self._last_invite_attempt > REINVITE_EVERY_SECONDS:
-            await self._invite_pending()
+        if (
+            self._pending
+            and (self._inviting is None or self._inviting.done())
+            and time.monotonic() - self._last_invite_attempt > REINVITE_EVERY_SECONDS
+        ):
+            # An unreachable observer takes INVITE_TIMEOUT_SECONDS to fail; don't hold up the round.
+            self._last_invite_attempt = time.monotonic()
+            self._inviting = asyncio.create_task(self._invite_pending())
         try:
             await self._session.publish_async(json.dumps(envelope).encode(), None, None)
         except Exception as err:  # noqa: BLE001 - SLIM is a side channel; the learner's UI must not depend on it
             log.warning("SLIM publish failed (%s: %s)", type(err).__name__, err)
 
     async def aclose(self) -> None:
+        if self._inviting is not None:
+            self._inviting.cancel()
         if self._app is not None and self._session is not None:
             try:
                 handle = await self._app.delete_session_async(self._session)

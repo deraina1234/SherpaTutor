@@ -79,6 +79,8 @@ class Argument:
     Code builds arguments; Jev judges whether they hold up. An argument with
     `attacks` set is a rebuttal of the argument with that id. The loop decides
     which arguments still stand; agents revise against those, not raw votes.
+    `text`, when set, is the agent's own wording of the claim, written by an LLM
+    from the agent's slice and checked by Jev against that slice.
     """
 
     id: str  # see argument_id()
@@ -88,6 +90,7 @@ class Argument:
     direction: int  # -1 less help, +1 more help, 0 pure rebuttal
     evidence: dict[str, Any] = field(default_factory=dict)  # JSON-safe values copied from the agent's slice
     attacks: str | None = None  # id of the argument this rebuts
+    text: str | None = None  # the agent's wording of the claim; None = use the tag's meaning
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -100,6 +103,8 @@ class Argument:
             raise ValueError(f"direction must be one of {ARGUMENT_DIRECTIONS}, got {self.direction!r}")
         if self.attacks == self.id:
             raise ValueError("an argument cannot attack itself")
+        if self.text is not None and (not isinstance(self.text, str) or not self.text.strip()):
+            raise ValueError(f"text must be a non-empty string or None, got {self.text!r}")
         secret = [key for key in self.evidence if key in SECRET_SLICE_FIELDS]
         if secret:
             raise ValueError(f"evidence must not include secret slice fields: {secret}")
@@ -119,6 +124,7 @@ class Argument:
             direction=data["direction"],
             evidence=dict(data.get("evidence", {})),
             attacks=data.get("attacks"),
+            text=data.get("text"),
         )
 
 

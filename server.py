@@ -24,11 +24,11 @@ from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-from agents import IntegrityAgent, LearningAgent, MomentumAgent
+from agents import IntegrityAgent, LearningAgent, MomentumAgent, Writer
 from agntcy_slim import FanoutBus, Publisher, start_publisher_from_env
 from contracts import HelpLevel, JevClient
 from deliberation import InProcBus, run_deliberation
-from hints import ALL_TESTS_PASS_TEXT, explain_deliberation_async, write_hint_async
+from hints import ALL_TESTS_PASS_TEXT, complete_text, explain_deliberation_async, write_hint_async
 from jev import TypeSafeJevClient, _load_env_file
 from logger import log_deliberation
 from redaction import redact, secret_values
@@ -58,12 +58,20 @@ def to_proposal(position: dict[str, Any]) -> dict[str, Any]:
     }
     if position.get("cap") is not None:
         proposal["cap"] = position["cap"]
+    arguments = [
+        {"claim": argument["claim"], "text": argument["text"]}
+        for argument in position.get("arguments", [])
+        if argument.get("text") and "responds_to" not in argument.get("evidence", {})
+    ]
+    if arguments:
+        proposal["arguments"] = arguments
     responses = [
         {
             "to": str(argument["evidence"]["responds_to"]).split(".", 1)[0],
             "claim": argument["claim"],
             "accepted": argument.get("attacks") is None,
             "holds": argument["evidence"].get("holds"),
+            "text": argument.get("text"),
         }
         for argument in position.get("arguments", [])
         if "responds_to" in argument.get("evidence", {})
@@ -103,9 +111,12 @@ def _hint(result: Any, requested_level: int) -> tuple[str | None, int]:
 
 
 class Connection:
-    def __init__(self, ws: WebSocket, jev: JevClient, log_path: Path, slim: Publisher | None = None) -> None:
+    def __init__(
+        self, ws: WebSocket, jev: JevClient, log_path: Path, slim: Publisher | None = None, writer: Writer | None = None
+    ) -> None:
         self.ws = ws
         self.jev = jev
+        self.writer = writer  # LLM that words the agents' arguments; None = tag meanings only
         self.log_path = log_path
         self.slim = slim  # AGNTCY SLIM channel that also receives every (redacted) round and decision
         self.session = Session()
@@ -207,7 +218,9 @@ class Connection:
         forwarder = asyncio.create_task(forward_rounds(subscription))
         try:
             decision = await run_deliberation(
-                [LearningAgent(self.jev), MomentumAgent(self.jev), IntegrityAgent(self.jev)], slices, bus=bus
+                [LearningAgent(self.jev, self.writer), MomentumAgent(self.jev, self.writer), IntegrityAgent(self.jev)],
+                slices,
+                bus=bus,
             )
         finally:
             subscription.unsubscribe()  # forwarder drains what was published, then stops
@@ -307,20 +320,25 @@ async def _none() -> None:
 
 
 def create_app(
-    jev: JevClient | None = None, log_path: Path = DEFAULT_LOG_PATH, slim: Publisher | None = None
+    jev: JevClient | None = None,
+    log_path: Path = DEFAULT_LOG_PATH,
+    slim: Publisher | None = None,
+    writer: Writer | None = None,
 ) -> FastAPI:
     """Build the app. Pass `jev` (e.g. FakeJevClient) to run without the TypeSafe API.
 
-    In the real app, SLIM publishing starts when SLIM_ENDPOINT is set (see agntcy_slim.py);
-    tests can pass a fake `slim` publisher instead.
+    In the real app, SLIM publishing starts when SLIM_ENDPOINT is set (see agntcy_slim.py)
+    and agents word their arguments with hints.complete_text; tests can pass a fake `slim`
+    publisher and `writer` instead.
     """
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if jev is not None:
-            app.state.jev, app.state.slim = jev, slim
+            app.state.jev, app.state.slim, app.state.writer = jev, slim, writer
             yield
             return
+        app.state.writer = writer or complete_text
         _load_env_file(str(ROOT / ".env.local"))
         publisher = await start_publisher_from_env()
         app.state.slim = publisher
@@ -341,7 +359,7 @@ def create_app(
     @app.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket) -> None:
         await ws.accept()
-        await Connection(ws, app.state.jev, log_path, app.state.slim).run()
+        await Connection(ws, app.state.jev, log_path, app.state.slim, app.state.writer).run()
 
     return app
 

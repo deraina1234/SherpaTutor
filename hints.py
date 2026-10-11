@@ -10,7 +10,8 @@ Per Section 10 of the Spotter design doc:
 - Explainer: Turns structured deliberation rounds, reason tags, and decisions into
   2-3 plain-language sentences for the side panel.
 - The LLM never decides whether to intervene; it only executes after the multi-agent
-  deliberation finishes.
+  deliberation finishes. During deliberation, complete_text() only words the agents'
+  arguments (see agents.py); Jev checks those words and decides what they are worth.
 
 Providers, tried in order: Nemotron (any OpenAI-compatible endpoint, e.g. NVIDIA's hosted
 API or vLLM on a Brev GPU; enabled by NEMOTRON_BASE_URL + NEMOTRON_MODEL), then Google
@@ -139,6 +140,24 @@ async def _nemotron_complete(prompt: str, transport: Any = None) -> str | None:
         logger.warning("Nemotron returned no text; trying the next provider.")
         return None
     return text
+
+
+async def complete_text(prompt: str, api_key: str | None = None, model: str = DEFAULT_GEMINI_MODEL) -> str | None:
+    """Plain completion for agents.Writer: Nemotron, then Gemini, else None (no template)."""
+    text = await _nemotron_complete(prompt)
+    if text:
+        return text
+    key = _get_api_key(api_key)
+    if not key:
+        return None
+    try:
+        from google import genai
+
+        response = await genai.Client(api_key=key).aio.models.generate_content(model=model, contents=prompt)
+        return (response.text or "").strip() or None
+    except Exception as err:
+        logger.warning("Gemini completion failed (%s: %s).", type(err).__name__, err)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +381,9 @@ def _deliberation_facts(decision: Decision) -> list[str]:
             facts.append(f"Integrity set a ceiling of {_level_name(position.cap)} (it does not vote).{noticed}")
         else:
             facts.append(f"{agent.title()} first voted for {_level_name(position.level)}, judging from your code and test results.{noticed}")
+        for a in position.arguments:
+            if a.text and "responds_to" not in a.evidence:
+                facts.append(f'{agent.title()} argued: "{a.text}"')
     for agent, position in last.items():
         for a in position.arguments:
             target = a.evidence.get("responds_to")
@@ -369,9 +391,10 @@ def _deliberation_facts(decision: Decision) -> list[str]:
                 continue
             peer = str(target).split(".", 1)[0].title()
             verdict = "agreed with" if a.attacks is None else "rejected"
+            said = f' It said: "{a.text}"' if a.text else ""
             facts.append(
                 f"In round {a.round}, {agent.title()} {verdict} {peer}'s point that "
-                f"{_CLAIM_TEXT.get(a.claim, a.claim)}."
+                f"{_CLAIM_TEXT.get(a.claim, a.claim)}.{said}"
             )
         if position.cap is None and agent in first and position.level != first[agent].level:
             facts.append(f"{agent.title()} moved from {_level_name(first[agent].level)} to {_level_name(position.level)}.")
@@ -380,7 +403,8 @@ def _deliberation_facts(decision: Decision) -> list[str]:
 
 def _build_explainer_prompt(decision: Decision, slices: dict[str, Any] | None = None) -> str:
     last_run = ((slices or {}).get("learning") or {}).get("last_run") or {}
-    if last_run.get("passed"):
+    passed = bool(last_run.get("passed"))
+    if passed:
         run_text = "The student's latest run passed every test."
     elif last_run.get("error"):
         run_text = f"The student's latest run failed: {last_run['error']}"
@@ -412,8 +436,13 @@ def _build_explainer_prompt(decision: Decision, slices: dict[str, Any] | None = 
         f"{cap_text}\n"
         f"Result: {result}\n\n"
         "Write 2-3 plain, friendly sentences to the student (\"you\") explaining why the agents landed here. "
-        "Start from the test result: if every test passed, say that is why no hint was needed. "
-        "Use only the facts above. Do not invent reasons, agreements, feelings, or a cap that was not applied. "
+        + (
+            "Start from the test result: every test passed, which is why no hint was needed. "
+            if passed
+            else "Start from the test result: the code still fails, so never say the tests passed or that no help was needed. "
+        )
+        + "Use only the facts above. Do not invent reasons, agreements, feelings, or a cap that was not applied. "
+        "End by stating the Result above, and never contradict it (if Sherpa gives a hint, do not say no hint was needed). "
         "Do not claim an agent voted a level because of a signal that points the other way "
         "(for example, no help because you asked for help), "
         "and do not describe Integrity as voting or siding with anyone."

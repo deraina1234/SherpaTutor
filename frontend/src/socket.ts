@@ -24,7 +24,13 @@ export type Proposal = {
   confidence: number;
   tags: string[];
   cap?: number; // Integrity's hard cap, if the backend sends it separately
+  arguments?: WrittenArgument[]; // this agent's own claims, in its own words (only those it wrote)
   responses?: Response[]; // this agent's verdicts on peers' arguments
+};
+
+export type WrittenArgument = {
+  claim: string; // the reason tag
+  text: string; // the agent's wording, checked by Jev against what the agent sees
 };
 
 export type Response = {
@@ -32,6 +38,7 @@ export type Response = {
   claim: string; // the reason tag the peer argued
   accepted: boolean;
   holds: number | null; // Jev's probability that the peer's argument holds
+  text?: string | null; // the agent's reply in its own words, if it wrote one
 };
 
 export type InMsg =

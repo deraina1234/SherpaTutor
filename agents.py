@@ -5,11 +5,21 @@ counters, hint timing) and states them as Arguments with evidence; Jev supplies 
 semantic judgments. In revise(), an agent has Jev judge each peer argument that
 pushes toward the peer's vote against what this agent observes. Arguments that hold
 move it one level; arguments that fail become rebuttals the UI and explainer show.
+
+With a writer (an LLM call), Learning and Momentum also put each argument and
+rebuttal in their own words, from their own slice. Jev checks every draft against
+that slice before it is used, and peers judge the written argument, not just its
+tag. Integrity never writes text: its slice holds the reference solution.
 """
 
 from __future__ import annotations
 
 import asyncio
+import difflib
+import json
+import logging
+import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from contracts import (
@@ -23,6 +33,11 @@ from contracts import (
     SliceDict,
     argument_id,
 )
+
+log = logging.getLogger("sherpa.agents")
+
+# Prompt -> text from an LLM, or None when no model answered.
+Writer = Callable[[str], Awaitable[str | None]]
 
 # Index = HelpLevel. Also used as the criteria for Jev level scores, so keep them descriptive.
 LEVEL_DESCRIPTIONS: list[str] = [
@@ -54,6 +69,22 @@ RECENT_HINT_SECONDS = 120
 LONG_IDLE_SECONDS = 180
 REPEATED_ERROR_COUNT = 2
 DEFAULT_POLICY_MAX_LEVEL = HelpLevel.POINT_TO_AREA
+GROUNDED_PROBABILITY = 0.6  # a written argument must be judged at least this well supported to be used
+REVEALS_PROBABILITY = 0.4  # a written argument judged above this to point at the fix is dropped
+MAX_ARGUMENT_CHARS = 300  # longer drafts are dropped, not cut mid-sentence
+MAX_ECHO_SIMILARITY = 0.75  # a reply this close to the argument it answers just repeats it
+
+_GROUNDED_QUESTION = (
+    "Is every factual statement in `argument_text` supported by `observations`, `signals`, or "
+    "`replying_to`? Answer no if it mentions a bug, value, line, or event that is not shown there."
+)
+# The learner reads every argument in the agent panel, so an argument must not do a hint's job.
+_REVEALS_QUESTION = (
+    "The learner will read `argument_text`. Does it tell them what is wrong in their code or what "
+    "to change, for example by naming a missing check, step, or condition? Reporting which test "
+    "failed and what the code returned is fine."
+)
+_JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _to_level(value: float) -> int:
@@ -69,20 +100,37 @@ def _responds_to(argument: Argument) -> str | None:
     return argument.evidence.get("responds_to")
 
 
+def _claim_text(argument: Argument) -> str:
+    """What the argument says: the agent's own words if it wrote any, else the tag's meaning."""
+    return argument.text or CLAIMS[argument.claim][1]
+
+
 class BaseAgent:
     """Shared propose/revise flow. Subclasses set name and goal and implement _initial_position."""
 
     name: str
     goal: str
     levels: list[str] = VOTING_LEVELS  # scale this agent scores and votes on; index = level
+    writes_arguments = True  # False for agents whose slice must never reach an LLM
 
-    def __init__(self, jev: JevClient) -> None:
+    def __init__(self, jev: JevClient, writer: Writer | None = None) -> None:
         self.jev = jev
+        self.writer = writer if self.writes_arguments else None
         self._last: Position | None = None
+        self._signals: dict[str, dict[str, Any]] = {}  # this agent's round-0 claims and their evidence
         self._judged: dict[str, float] = {}  # peer argument id -> probability it holds
 
     async def propose(self, slice: SliceDict) -> Position:
         level, confidence, evidence, cap = await self._initial_position(slice)
+        self._signals = evidence
+        texts = await self._write(
+            slice,
+            level,
+            {
+                claim: f"Argue for {'more' if CLAIMS[claim][0] > 0 else 'less'} help because {CLAIMS[claim][1]} ({_facts(facts)})."
+                for claim, facts in evidence.items()
+            },
+        )
         arguments = [
             Argument(
                 id=argument_id(self.name, 0, claim),
@@ -91,6 +139,7 @@ class BaseAgent:
                 claim=claim,
                 direction=CLAIMS[claim][0],
                 evidence=facts,
+                text=texts.get(claim),
             )
             for claim, facts in evidence.items()
         ]
@@ -128,7 +177,14 @@ class BaseAgent:
             self._judged[argument.id] = probability
 
         accepted = [a for a in pulling if self._judged[a.id] >= ACCEPT_PROBABILITY]
-        responses = [self._response(a, round) for a in new if not REJECT_PROBABILITY < self._judged[a.id] < ACCEPT_PROBABILITY]
+        decided = [a for a in new if not REJECT_PROBABILITY < self._judged[a.id] < ACCEPT_PROBABILITY]
+        texts = await self._write(
+            slice,
+            previous.level,
+            {a.id: self._reply_task(a) for a in decided},
+            {a.id: {"agent": a.agent, "claim": _claim_text(a), "evidence": a.evidence} for a in decided},
+        )
+        responses = [self._response(a, round, texts.get(a.id)) for a in decided]
 
         step = _sign(sum(a.direction for a in accepted)) * MAX_LEVEL_STEP_PER_ROUND
         ceiling = len(self.levels) - 1 if previous.cap is None else min(previous.cap, len(self.levels) - 1)
@@ -156,12 +212,12 @@ class BaseAgent:
             "my_vote": {
                 "level": mine.level,
                 "meaning": self.levels[min(mine.level, len(self.levels) - 1)],
-                "my_reasons": [CLAIMS[a.claim][1] for a in mine.arguments if a.claim in CLAIMS and _responds_to(a) is None],
+                "my_reasons": [_claim_text(a) for a in mine.arguments if _responds_to(a) is None],
             },
             "peer_argument": {
                 "agent": argument.agent,
                 "wants": "more help" if argument.direction > 0 else "less help",
-                "claim": CLAIMS[argument.claim][1],
+                "claim": _claim_text(argument),
                 "evidence": argument.evidence,
             },
         }
@@ -175,7 +231,82 @@ class BaseAgent:
         result = await self.jev.noul(state, question)
         return result.probability
 
-    def _response(self, argument: Argument, round: int) -> Argument:
+    def _reply_task(self, argument: Argument) -> str:
+        probability = self._judged[argument.id]
+        held = probability >= ACCEPT_PROBABILITY
+        peer = argument.agent.title()
+        return (
+            f"{peer} argued for {'more' if argument.direction > 0 else 'less'} help: "
+            f'"{_claim_text(argument)}" ({_facts(argument.evidence)}). You judged that this '
+            f"{'holds' if held else 'does not hold'} ({round(probability * 100)}% likely to hold). "
+            f"Start with \"{'I agree' if held else 'I disagree'}\" and give {peer} your own reason, from your goal "
+            "and what you observe. Treat their facts as true: argue about what those facts mean for how much "
+            "help to give, not whether they happened. Do not restate their argument."
+        )
+
+    async def _write(
+        self,
+        slice: SliceDict,
+        level: int,
+        tasks: dict[str, str],
+        replying_to: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, str]:
+        """Have the writer word each task in this agent's voice; keep only drafts Jev finds grounded.
+
+        `replying_to` maps a task key to the peer argument it answers, so a reply may cite it.
+        """
+        if self.writer is None or not tasks:
+            return {}
+        try:
+            raw = await self.writer(self._write_prompt(slice, level, tasks))
+        except Exception as err:
+            log.warning("%s: writer failed (%s: %s); using tag meanings.", self.name, type(err).__name__, err)
+            return {}
+        drafts = _parse_drafts(raw, tasks)
+        state = self._state(slice, self._signals)
+        states = [{**state, "replying_to": (replying_to or {}).get(key), "argument_text": text} for key, text in drafts.items()]
+        grounded, reveals = await asyncio.gather(
+            asyncio.gather(*(self.jev.noul(s, _GROUNDED_QUESTION) for s in states)),
+            asyncio.gather(*(self.jev.noul(s, _REVEALS_QUESTION) for s in states)),
+        )
+        kept: dict[str, str] = {}
+        for (key, text), check, reveal in zip(drafts.items(), grounded, reveals):
+            if reveal.probability > REVEALS_PROBABILITY:
+                log.info("%s dropped a draft for %s that points at the fix (%.2f): %s", self.name, key, reveal.probability, text)
+                continue
+            answered = (replying_to or {}).get(key)
+            if answered and difflib.SequenceMatcher(None, text.lower(), answered["claim"].lower()).ratio() > MAX_ECHO_SIMILARITY:
+                log.info("%s dropped a reply to %s that repeats it: %s", self.name, key, text)
+                continue
+            if check.probability >= GROUNDED_PROBABILITY:
+                kept[key] = text
+            else:
+                log.info("%s dropped an ungrounded draft for %s (%.2f): %s", self.name, key, check.probability, text)
+        log.info("%s wrote %d of %d argument(s); %d kept.", self.name, len(drafts), len(tasks), len(kept))
+        return kept
+
+    def _write_prompt(self, slice: SliceDict, level: int, tasks: dict[str, str]) -> str:
+        signals = [f"{CLAIMS[claim][1]} ({_facts(evidence)})" for claim, evidence in self._signals.items()]
+        items = "\n".join(f"- {json.dumps(key)}: {task}" for key, task in tasks.items())
+        return (
+            f"You are the {self.name.title()} agent in Sherpa, a coding tutor where agents debate how much "
+            f"help a learner should get.\nYour goal: {self.goal}\n"
+            f"Your vote: level {level}, {self.levels[min(level, len(self.levels) - 1)]}.\n"
+            f"What you observe (JSON): {json.dumps(dict(slice), default=str)}\n"
+            f"Signals measured from that: {'; '.join(signals) or 'none'}\n\n"
+            "For each item below, write one sentence of at most 35 words, addressed to the other agents. "
+            "The learner reads these too, so describe their situation and behavior, never what is wrong "
+            "in their code or what to change. "
+            "Base it only on what you observe: cite concrete test results, counts, or times. "
+            "Never invent a bug, line, value, or event. Never say how to fix the code. "
+            "Write plain language a teacher would use: no field names (like p_concept_gap or "
+            "seconds_since_last_edit) and no probabilities. In a test result, \"expected X, got Y\" "
+            "means the learner's code returned Y where it should have returned X.\n"
+            f"Items:\n{items}\n\n"
+            "Reply with only a JSON object that maps each item key to its sentence."
+        )
+
+    def _response(self, argument: Argument, round: int, text: str | None = None) -> Argument:
         """Record this agent's verdict on a peer argument: accepted, or a rebuttal."""
         probability = self._judged[argument.id]
         held = probability >= ACCEPT_PROBABILITY
@@ -187,6 +318,7 @@ class BaseAgent:
             direction=argument.direction if held else 0,
             evidence={"responds_to": argument.id, "holds": _round_probability(probability)},
             attacks=None if held else argument.id,
+            text=text,
         )
 
     async def _initial_position(
@@ -213,6 +345,25 @@ def _round_probability(value: float) -> float:
 
 def _facts(evidence: dict[str, Any]) -> str:
     return ", ".join(f"{key}={value}" for key, value in evidence.items())
+
+
+def _parse_drafts(raw: str | None, tasks: dict[str, str]) -> dict[str, str]:
+    """Pull {task key: sentence} out of the writer's reply, dropping anything malformed."""
+    match = _JSON_OBJECT.search(raw or "")
+    if match is None:
+        return {}
+    try:
+        data = json.loads(match.group(0))
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    drafts: dict[str, str] = {}
+    for key in tasks:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip() and len(value.strip()) <= MAX_ARGUMENT_CHARS:
+            drafts[key] = value.strip()
+    return drafts
 
 
 def _last_error(slice: SliceDict) -> str | None:
@@ -312,6 +463,7 @@ class IntegrityAgent(BaseAgent):
     name = "integrity"
     goal = "Never let a hint give away the task's solution."
     levels = LEVEL_DESCRIPTIONS  # judges the full scale; the cap is then clamped to policy_max_level
+    writes_arguments = False  # its slice holds the reference solution
 
     async def revise(self, slice: SliceDict, peers: list[Position], round: int) -> Position:
         if self._last is None:

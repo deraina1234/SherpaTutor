@@ -225,6 +225,19 @@ function AgentCard({
               ))}
             </div>
           )}
+          {latest.arguments && latest.arguments.length > 0 && (
+            <div style={{ display: "grid", gap: 4, fontSize: 12, lineHeight: 1.4 }}>
+              {latest.arguments.map((a) => (
+                <div
+                  key={a.claim}
+                  title={tagLabel(a.claim)}
+                  style={{ color: "#ddd", borderLeft: `2px solid ${meta.color}`, paddingLeft: 6 }}
+                >
+                  "{a.text}"
+                </div>
+              ))}
+            </div>
+          )}
           {latest.responses && latest.responses.length > 0 && (
             <div style={{ display: "grid", gap: 2, fontSize: 12, lineHeight: 1.4 }}>
               {latest.responses.map((r) => (
@@ -232,6 +245,7 @@ function AgentCard({
                   {r.accepted ? "Agreed with" : "Rejected"} {r.to.replace(/^./, (c) => c.toUpperCase())}: "
                   {tagLabel(r.claim)}"
                   {r.holds !== null && <span style={{ color: "#777" }}> ({Math.round(r.holds * 100)}% holds)</span>}
+                  {r.text && <div style={{ color: "#ccc", paddingLeft: 10 }}>"{r.text}"</div>}
                 </div>
               ))}
             </div>

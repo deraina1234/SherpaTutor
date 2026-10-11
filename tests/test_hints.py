@@ -294,3 +294,26 @@ def test_explainer_prompt_lists_only_real_facts() -> None:
     assert "Integrity set a ceiling of a conceptual hint (it does not vote)." in prompt
     assert "the ceiling changed nothing" in prompt
     assert "passed every test" in prompt
+
+
+def test_explainer_prompt_quotes_the_agents_written_arguments() -> None:
+    from contracts import Argument
+    from hints import _build_explainer_prompt
+
+    idle = Argument(
+        id="momentum.r0.long_idle", agent="momentum", round=0, claim="long_idle", direction=1,
+        text="No edits for 240 seconds.",
+    )
+    rebuttal = Argument(
+        id="learning.r1.re.momentum.r0.long_idle", agent="learning", round=1, claim="long_idle", direction=0,
+        evidence={"responds_to": "momentum.r0.long_idle", "holds": 0.2}, attacks="momentum.r0.long_idle",
+        text="They ran the tests 40 seconds ago.",
+    )
+    momentum = Position(agent="momentum", round=0, level=2, confidence=0.8, reason_tags=["long_idle"], arguments=[idle])
+    round0 = [make_pos("learning", 0, 0), momentum, make_pos("integrity", 0, 2, cap=2)]
+    round1 = [Position(agent="learning", round=1, level=0, confidence=0.85, arguments=[rebuttal]), momentum, round0[2]]
+    decision = Decision(OutcomeKind.DEADLOCK, None, [round0, round1], cap_applied=False, ask_learner=True, rounds_used=2)
+    prompt = _build_explainer_prompt(decision)
+
+    assert 'Momentum argued: "No edits for 240 seconds."' in prompt
+    assert 'rejected Momentum\'s point that you had stopped editing for a while. It said: "They ran the tests 40 seconds ago."' in prompt

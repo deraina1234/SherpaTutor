@@ -5,6 +5,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from contracts import JevNoul
 from jev import FakeJevClient
 from hints import ALL_TESTS_PASS_TEXT, HintResult
 from server import _hint, create_app, nudge_level, round_message, to_proposal
@@ -141,9 +142,25 @@ def test_to_proposal_lists_responses_to_peer_arguments() -> None:
     rebuttal = {
         "id": "learning.r1.re.momentum.r0.long_idle", "agent": "learning", "round": 1, "claim": "long_idle",
         "direction": 0, "evidence": {"responds_to": "momentum.r0.long_idle", "holds": 0.2}, "attacks": "momentum.r0.long_idle",
+        "text": "They ran the tests 40 seconds ago, so they are not idle.",
     }
-    position = {"agent": "learning", "level": 0, "confidence": 0.5, "reason_tags": [], "cap": None, "arguments": [rebuttal]}
-    assert to_proposal(position)["responses"] == [{"to": "momentum", "claim": "long_idle", "accepted": False, "holds": 0.2}]
+    own = {
+        "id": "learning.r0.active_progress", "agent": "learning", "round": 0, "claim": "active_progress",
+        "direction": -1, "evidence": {"recent_progress": True}, "attacks": None, "text": "Two more tests pass than before.",
+    }
+    untexted = {**own, "id": "learning.r0.recent_hint_given", "claim": "recent_hint_given", "text": None}
+    position = {
+        "agent": "learning", "level": 0, "confidence": 0.5, "reason_tags": [], "cap": None,
+        "arguments": [own, untexted, rebuttal],
+    }
+    proposal = to_proposal(position)
+    assert proposal["arguments"] == [{"claim": "active_progress", "text": "Two more tests pass than before."}]
+    assert proposal["responses"] == [
+        {
+            "to": "momentum", "claim": "long_idle", "accepted": False, "holds": 0.2,
+            "text": "They ran the tests 40 seconds ago, so they are not idle.",
+        }
+    ]
 
 
 def test_nudge_on_solved_code_says_tests_pass_instead_of_hinting(tmp_path) -> None:
@@ -155,3 +172,30 @@ def test_nudge_on_solved_code_says_tests_pass_instead_of_hinting(tmp_path) -> No
         ws.send_json(event("ask_nudge"))
         assert ws.receive_json() == {"type": "hint", "level": 0, "text": ALL_TESTS_PASS_TEXT}
     assert jev.calls == []  # no deliberation, no leak check
+
+
+def test_agents_word_their_arguments_when_the_app_has_a_writer(tmp_path) -> None:
+    class Jev(FakeJevClient):
+        async def noul(self, state: dict, question: str):
+            if "argument_text" in state and "will read" in question:
+                self.calls.append(("noul", state, question))
+                return JevNoul(probability=0.1, confidence=0.9)  # does not point at the fix
+            return await super().noul(state, question)
+
+    prompts: list[str] = []
+
+    async def writer(prompt: str) -> str:
+        prompts.append(prompt)
+        return '{"concept_gap": "Case 2 returns 5 where 4 is expected."}'
+
+    app = create_app(jev=Jev(score_value=1, noul_probability=0.9), log_path=tmp_path / "sessions.jsonl", writer=writer)
+    with TestClient(app) as c, c.websocket_connect("/ws") as ws:
+        ws.send_json(event("problem", seconds_ago=60))
+        ws.send_json(event("edit", seconds_ago=30, snapshot=CODE, diff_summary={"added": 2, "deleted": 1}))
+        ws.send_json(event("run", passed=False, first_error="Case 2: expected 4, got 5"))
+        round0 = ws.receive_json()
+
+    by_agent = {p["agent"]: p for p in round0["proposals"]}
+    assert by_agent["learning"]["arguments"] == [{"claim": "concept_gap", "text": "Case 2 returns 5 where 4 is expected."}]
+    assert "arguments" not in by_agent["integrity"]
+    assert all("reference_solution_summary" not in prompt for prompt in prompts)

@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from agents import IntegrityAgent, LearningAgent, MomentumAgent
-from contracts import Argument, Position, argument_id
+from contracts import Argument, JevNoul, Position, argument_id
 from jev import FakeJevClient
 
 LEARNING_SLICE = {
@@ -197,3 +197,112 @@ def test_integrity_revise_holds_without_calling_jev() -> None:
 def test_integrity_revise_before_propose_raises() -> None:
     with pytest.raises(RuntimeError):
         asyncio.run(IntegrityAgent(FakeJevClient()).revise(INTEGRITY_SLICE, [], 1))
+
+
+class GroundingJev(FakeJevClient):
+    """FakeJevClient whose grounding checks pass unless the draft mentions `ungrounded`."""
+
+    def __init__(self, ungrounded: str = "indentation", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.ungrounded = ungrounded
+
+    async def noul(self, state: dict, question: str):
+        if "argument_text" in state:
+            self.calls.append(("noul", state, question))
+            text = state["argument_text"]
+            if "will read" in question:  # the reveals-the-fix check
+                return JevNoul(probability=0.9 if "missing check" in text else 0.1, confidence=0.9)
+            return JevNoul(probability=0.1 if self.ungrounded in text else 0.9, confidence=0.9)
+        return await super().noul(state, question)
+
+
+def scripted_writer(reply: str | Exception):
+    prompts: list[str] = []
+
+    async def write(prompt: str) -> str | None:
+        prompts.append(prompt)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    return write, prompts
+
+
+def test_propose_words_arguments_with_writer_and_checks_them_with_jev() -> None:
+    reply = '```json\n{"repeated_error": "Case 4 failed the same way 3 runs in a row.", "long_idle": "No edits for 240 seconds."}\n```'
+    writer, prompts = scripted_writer(reply)
+    jev = GroundingJev(score_value=2, noul_probability=0.1)
+    position = asyncio.run(MomentumAgent(jev, writer).propose(MOMENTUM_SLICE))
+    texts = {a.claim: a.text for a in position.arguments}
+    assert texts == {"repeated_error": "Case 4 failed the same way 3 runs in a row.", "long_idle": "No edits for 240 seconds."}
+    assert len(prompts) == 1 and '"repeated_error"' in prompts[0] and "240" in prompts[0]
+    checked = [state["argument_text"] for kind, state, _ in jev.calls if "argument_text" in state]
+    assert sorted(checked) == sorted([*texts.values(), *texts.values()])  # grounded? and reveals the fix?
+
+
+def test_propose_drops_drafts_that_fail_the_grounding_check() -> None:
+    writer, _ = scripted_writer('{"repeated_error": "Your indentation is wrong on line 3.", "long_idle": "No edits for 240 seconds."}')
+    position = asyncio.run(MomentumAgent(GroundingJev(score_value=2, noul_probability=0.1), writer).propose(MOMENTUM_SLICE))
+    texts = {a.claim: a.text for a in position.arguments}
+    assert texts == {"repeated_error": None, "long_idle": "No edits for 240 seconds."}
+
+
+@pytest.mark.parametrize("reply", ["not json at all", '{"repeated_error": 3}', '["a list"]', RuntimeError("model down")])
+def test_propose_falls_back_to_tags_when_the_writer_fails(reply) -> None:
+    writer, _ = scripted_writer(reply)
+    position = asyncio.run(MomentumAgent(GroundingJev(score_value=2, noul_probability=0.1), writer).propose(MOMENTUM_SLICE))
+    assert position.reason_tags == ["repeated_error", "long_idle"]
+    assert all(a.text is None for a in position.arguments)
+
+
+def test_integrity_never_sends_its_slice_to_the_writer() -> None:
+    writer, prompts = scripted_writer('{"solution_leak_risk": "anything"}')
+    position = asyncio.run(IntegrityAgent(FakeJevClient(score_value=4, noul_probability=0.9), writer).propose(INTEGRITY_SLICE))
+    assert prompts == []
+    assert position.arguments[0].text is None
+
+
+def test_revise_judges_the_peers_written_argument_and_words_its_rebuttal() -> None:
+    writer, prompts = scripted_writer('{"momentum.r0.long_idle": "They ran the tests 40 seconds ago."}')
+    jev = GroundingJev(score_value=1, noul_probability=0.1)
+    agent = LearningAgent(jev, writer)
+    momentum = argued("momentum", 3, "long_idle", 1)
+    momentum = Position(
+        agent="momentum", round=0, level=3, confidence=0.8, reason_tags=["long_idle"],
+        arguments=[Argument(**{**momentum.arguments[0].to_dict(), "text": "No edits for 240 seconds."})],
+    )
+
+    async def run() -> Position:
+        await agent.propose(LEARNING_SLICE)
+        return await agent.revise(LEARNING_SLICE, [momentum], 1)
+
+    revised = asyncio.run(run())
+    judged = [state for kind, state, _ in jev.calls if "peer_argument" in state]
+    assert judged[0]["peer_argument"]["claim"] == "No edits for 240 seconds."
+    rebuttal = revised.arguments[-1]
+    assert rebuttal.attacks == "momentum.r0.long_idle"
+    assert rebuttal.text == "They ran the tests 40 seconds ago."
+    assert "does not hold" in prompts[-1] and "No edits for 240 seconds." in prompts[-1]
+
+
+def test_revise_drops_a_reply_that_just_repeats_the_peer() -> None:
+    writer, _ = scripted_writer('{"momentum.r0.long_idle": "No edits for 240 seconds!"}')
+    agent = LearningAgent(GroundingJev(score_value=1, noul_probability=0.1), writer)
+    momentum = argued("momentum", 3, "long_idle", 1)
+    momentum = Position(
+        agent="momentum", round=0, level=3, confidence=0.8, reason_tags=["long_idle"],
+        arguments=[Argument(**{**momentum.arguments[0].to_dict(), "text": "No edits for 240 seconds."})],
+    )
+
+    async def run() -> Position:
+        await agent.propose(LEARNING_SLICE)
+        return await agent.revise(LEARNING_SLICE, [momentum], 1)
+
+    rebuttal = asyncio.run(run()).arguments[-1]
+    assert rebuttal.attacks == "momentum.r0.long_idle" and rebuttal.text is None
+
+
+def test_propose_drops_drafts_that_point_at_the_fix() -> None:
+    writer, _ = scripted_writer('{"repeated_error": "There is a missing check after the loop.", "long_idle": "No edits for 240 seconds."}')
+    position = asyncio.run(MomentumAgent(GroundingJev(score_value=2, noul_probability=0.1), writer).propose(MOMENTUM_SLICE))
+    assert {a.claim: a.text for a in position.arguments} == {"repeated_error": None, "long_idle": "No edits for 240 seconds."}
