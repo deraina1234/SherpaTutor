@@ -15,13 +15,6 @@ SECRET = task_for(PID).reference_solution_summary
 CODE = "def second_largest(nums):\n    nums.sort()\n    return nums[-2]\n"
 
 
-@pytest.fixture(autouse=True)
-def offline_hints(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Template hints and explanations; never call Gemini from tests.
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-
-
 def event(kind: str, seconds_ago: float = 0, **fields) -> dict:
     return {"type": kind, "ts": int((time.time() - seconds_ago) * 1000), "problem_id": PID, **fields}
 
